@@ -1,0 +1,7 @@
+[wrap-git]
+directory = ace
+url = git@github.com:OnionSpirit/ace.git
+revision = master
+
+[provide]
+dependency_names = ace
