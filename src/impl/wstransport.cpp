@@ -9,9 +9,11 @@
 #include "wstransport.hpp"
 #include "httpproxytransport.hpp"
 #include "tcptransport.hpp"
-#include "threadpool.hpp"
 #include "tlstransport.hpp"
 #include "utils.hpp"
+
+#include <ace/core/dispatcher.h>
+#include <ace/futures/timeout.h>
 
 #if RTC_ENABLE_WEBSOCKET
 
@@ -102,12 +104,13 @@ void WsTransport::close() {
 		return;
 	}
 
-	ThreadPool::Instance().schedule(std::chrono::seconds(10), [weak_this = weak_from_this()]() {
+	ace::schedule([](std::weak_ptr<WsTransport> weak_this) -> ace::task {
+		co_await ace::futures::timeout(std::chrono::seconds(10));
 		if (auto locked = weak_this.lock()) {
 			PLOG_DEBUG << "WebSocket close timeout";
 			locked->changeState(State::Disconnected);
 		}
-	});
+	}(weak_from_this()));
 }
 
 void WsTransport::incoming(message_ptr message) {

@@ -9,9 +9,10 @@
 #include "tlstransport.hpp"
 #include "httpproxytransport.hpp"
 #include "tcptransport.hpp"
-#include "threadpool.hpp"
 
 #if RTC_ENABLE_WEBSOCKET
+
+#include <ace/core/dispatcher.h>
 
 #include <algorithm>
 #include <chrono>
@@ -28,7 +29,10 @@ void TlsTransport::enqueueRecv() {
 
 	if (auto shared_this = weak_from_this().lock()) {
 		++mPendingRecvCount;
-		ThreadPool::Instance().enqueue(&TlsTransport::doRecv, std::move(shared_this));
+		ace::schedule([shared_this]() -> ace::task {
+			shared_this->doRecv();
+			co_return;
+		}());
 	}
 }
 

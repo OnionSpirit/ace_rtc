@@ -10,7 +10,7 @@
 #define RTC_SERVER_LOGCOUNTER_HPP
 
 #include "common.hpp"
-#include "threadpool.hpp"
+#include "internals.hpp"
 
 #include <atomic>
 #include <chrono>

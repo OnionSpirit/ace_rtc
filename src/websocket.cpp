@@ -67,7 +67,8 @@ optional<string> WebSocket::remoteAddress() const {
 optional<string> WebSocket::path() const {
 	auto state = impl()->state.load();
 	auto handshake = impl()->getWsHandshake();
-	return state != State::Connecting && handshake ? make_optional(handshake->path()) : nullopt;
+	return state != State::Connecting && handshake
+	           ? make_optional(handshake->path()) : nullopt;
 }
 
 std::multimap<string, string, case_insensitive_less> WebSocket::requestHeaders() const {

@@ -7,7 +7,9 @@
  */
 
 #include "certificate.hpp"
-#include "threadpool.hpp"
+#include "internals.hpp"
+
+#include <ace/core/dispatcher.h>
 
 #include <algorithm>
 #include <cassert>
@@ -595,9 +597,17 @@ string make_fingerprint(X509 *x509, CertificateFingerprint::Algorithm fingerprin
 // Common for GnuTLS, Mbed TLS, and OpenSSL
 
 future_certificate_ptr make_certificate(CertificateType type) {
-	return ThreadPool::Instance().enqueue([type, token = Init::Instance().token()]() {
-		return std::make_shared<Certificate>(Certificate::Generate(type, "libdatachannel"));
-	});
+	auto promise = std::make_shared<std::promise<shared_ptr<Certificate>>>();
+	auto future = promise->get_future().share();
+	ace::schedule([type, promise, token = Init::Instance().token()]() mutable -> ace::task {
+		try {
+			promise->set_value(std::make_shared<Certificate>(Certificate::Generate(type, "libdatachannel")));
+		} catch (...) {
+			promise->set_exception(std::current_exception());
+		}
+		co_return;
+	}());
+	return future;
 }
 
 CertificateFingerprint Certificate::fingerprint() const {

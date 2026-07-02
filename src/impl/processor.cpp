@@ -22,7 +22,10 @@ void Processor::join() {
 void Processor::schedule() {
 	std::unique_lock lock(mMutex);
 	if (auto next = mTasks.pop()) {
-		ThreadPool::Instance().enqueue(std::move(*next));
+		ace::schedule([task = std::move(*next)]() mutable -> ace::task {
+			task();
+			co_return;
+		}());
 	} else {
 		// No more tasks
 		mPending = false;

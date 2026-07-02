@@ -10,7 +10,9 @@
 #include "dtlssrtptransport.hpp"
 #include "icetransport.hpp"
 #include "internals.hpp"
-#include "threadpool.hpp"
+
+#include <ace/core/dispatcher.h>
+#include <ace/futures/timeout.h>
 
 #include <algorithm>
 #include <chrono>
@@ -35,10 +37,11 @@ void DtlsTransport::enqueueRecv() {
 
 	++mPendingRecvCount;
 
-	ThreadPool::Instance().enqueue([weak_this = weak_from_this()]() {
+	ace::schedule([](std::weak_ptr<DtlsTransport> weak_this) -> ace::task {
 		if (auto locked = weak_this.lock())
 			locked->doRecv();
-	});
+		co_return;
+	}(weak_from_this()));
 }
 
 #if USE_GNUTLS
@@ -202,11 +205,12 @@ void DtlsTransport::doRecv() {
 
 				if (ret == GNUTLS_E_AGAIN) {
 					// Schedule next call on timeout and return
-					auto timeout = milliseconds(gnutls_dtls_get_timeout(mSession));
-					ThreadPool::Instance().schedule(timeout, [weak_this = weak_from_this()]() {
-						if (auto locked = weak_this.lock())
-							locked->doRecv();
-					});
+				auto timeout = milliseconds(gnutls_dtls_get_timeout(mSession));
+				ace::schedule([](std::weak_ptr<DtlsTransport> weak_this, auto to) -> ace::task {
+					co_await ace::futures::timeout(to);
+					if (auto locked = weak_this.lock())
+						locked->doRecv();
+				}(weak_from_this(), timeout));
 					return;
 				}
 
@@ -543,11 +547,12 @@ void DtlsTransport::doRecv() {
 				}
 
 				if (ret == MBEDTLS_ERR_SSL_WANT_READ) {
-					ThreadPool::Instance().schedule(mTimerSetAt + milliseconds(mFinMs),
-					                                [weak_this = weak_from_this()]() {
-						                                if (auto locked = weak_this.lock())
-							                                locked->doRecv();
-					                                });
+					auto deadline = mTimerSetAt + milliseconds(mFinMs);
+					ace::schedule([](std::weak_ptr<DtlsTransport> weak_this, auto dl) -> ace::task {
+						co_await ace::futures::expire(dl);
+						if (auto locked = weak_this.lock())
+							locked->doRecv();
+					}(weak_from_this(), deadline));
 					return;
 				}
 
@@ -1031,10 +1036,11 @@ void DtlsTransport::handleTimeout() {
 			throw std::runtime_error("Handshake timeout");
 
 		LOG_VERBOSE << "DTLS retransmit timeout is " << timeout.count() << "ms";
-		ThreadPool::Instance().schedule(timeout, [weak_this = weak_from_this()]() {
+		ace::schedule([](std::weak_ptr<DtlsTransport> weak_this, auto to) -> ace::task {
+			co_await ace::futures::timeout(to);
 			if (auto locked = weak_this.lock())
 				locked->doRecv();
-		});
+		}(weak_from_this(), timeout));
 	}
 }
 

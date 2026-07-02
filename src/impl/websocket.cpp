@@ -18,6 +18,9 @@
 #include "tcptransport.hpp"
 #include "tlstransport.hpp"
 #include "verifiedtlstransport.hpp"
+
+#include <ace/core/dispatcher.h>
+#include <ace/futures/timeout.h>
 #include "wstransport.hpp"
 
 #include <array>
@@ -531,7 +534,8 @@ void WebSocket::scheduleConnectionTimeout() {
 	auto defaultTimeout = 30s;
 	auto timeout = config.connectionTimeout.value_or(milliseconds(defaultTimeout));
 	if (timeout > milliseconds::zero()) {
-		ThreadPool::Instance().schedule(timeout, [weak_this = weak_from_this()]() {
+		ace::schedule([](auto weak_this, auto timeout) -> ace::task {
+			co_await ace::futures::timeout(timeout);
 			if (auto locked = weak_this.lock()) {
 				if (locked->state == WebSocket::State::Connecting) {
 					PLOG_WARNING << "WebSocket connection timed out";
@@ -539,7 +543,7 @@ void WebSocket::scheduleConnectionTimeout() {
 					locked->remoteClose();
 				}
 			}
-		});
+		}(weak_from_this(), timeout));
 	}
 }
 

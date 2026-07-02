@@ -2,7 +2,7 @@ project(
     'ace_rtc',
     'cpp',
     version: '0.24.5',
-    default_options: ['cpp_std=c++17'],
+    default_options: ['cpp_std=c++23'],
     meson_version: '>=0.64.0',
 )
 

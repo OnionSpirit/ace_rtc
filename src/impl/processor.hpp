@@ -11,7 +11,8 @@
 
 #include "common.hpp"
 #include "queue.hpp"
-#include "threadpool.hpp"
+
+#include <ace/core/dispatcher.h>
 
 #include <condition_variable>
 #include <future>
@@ -64,7 +65,10 @@ template <class F, class... Args> void Processor::enqueue(F &&f, Args &&...args)
 	};
 
 	if (!mPending) {
-		ThreadPool::Instance().enqueue(std::move(task));
+		ace::schedule([task = std::move(task)]() mutable -> ace::task {
+			task();
+			co_return;
+		}());
 		mPending = true;
 	} else {
 		mTasks.push(std::move(task));
