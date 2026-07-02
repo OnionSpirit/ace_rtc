@@ -1,0 +1,7 @@
+[wrap-git]
+directory = libjuice
+url = https://github.com/paullouisageneau/libjuice.git
+revision = 3c40a3545b6b1b62c7adee7f8f2bd58aa290afd6
+
+[provide]
+dependency_names = libjuice

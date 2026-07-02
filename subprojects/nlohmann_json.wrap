@@ -1,0 +1,8 @@
+[wrap-git]
+directory = nlohmann_json
+url = https://github.com/nlohmann/json.git
+revision = 55f93686c01528224f448c19128836e7df245f72
+depth = 1
+
+[provide]
+dependency_names = nlohmann_json

@@ -1,0 +1,8 @@
+[wrap-git]
+directory = plog
+url = https://github.com/SergiusTheBest/plog.git
+revision = 94899e0b926ac1b0f4750bfbd495167b4a6ae9ef
+depth = 1
+
+[provide]
+dependency_names = plog

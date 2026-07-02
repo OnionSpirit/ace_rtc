@@ -1,0 +1,8 @@
+[wrap-git]
+directory = usrsctp
+url = https://github.com/paullouisageneau/usrsctp.git
+revision = fec583d54493f879d2ae44a743423bf8a04371ab
+depth = 1
+
+[provide]
+dependency_names = usrsctp

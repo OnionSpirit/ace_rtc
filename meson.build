@@ -220,38 +220,14 @@ thread_dep = dependency('threads')
 if _use_system_plog
     plog_dep = dependency('plog', required: true)
 else
-    plog_dep = dependency('plog', required: false)
-    if not plog_dep.found()
-        plog_subp = subproject('plog', required: false)
-        if plog_subp.found()
-            plog_dep = plog_subp.get_variable('plog_dep')
-        endif
-    endif
-    if not plog_dep.found()
-        message('plog not found as system lib or subproject; building from deps/plog')
-        plog_dep = declare_dependency(
-            include_directories: include_directories('deps/plog/include'),
-        )
-    endif
+    plog_dep = dependency('plog', fallback: ['plog', 'plog_dep'], required: true)
 endif
 
 # usrsctp
 if _use_system_usrsctp
     usrsctp_dep = dependency('usrsctp', required: true)
 else
-    usrsctp_dep = dependency('usrsctp', required: false)
-    if not usrsctp_dep.found()
-        usrsctp_subp = subproject('usrsctp', required: false)
-        if usrsctp_subp.found()
-            usrsctp_dep = usrsctp_subp.get_variable('usrsctp_dep')
-        endif
-    endif
-    if not usrsctp_dep.found()
-        message('usrsctp not found as system lib; building from deps/usrsctp')
-        usrsctp_dep = declare_dependency(
-            include_directories: include_directories('deps/usrsctp/usrsctplib'),
-        )
-    endif
+    usrsctp_dep = dependency('usrsctp', fallback: ['usrsctp', 'usrsctp_dep'], required: true)
 endif
 
 # TLS backend
@@ -280,20 +256,15 @@ if not _no_media
     if _use_system_srtp
         srtp_dep = dependency('libsrtp2', required: true)
     else
-        srtp_dep = dependency('libsrtp2', required: false)
-        if not srtp_dep.found()
-            srtp_subp = subproject('libsrtp', required: false)
-            if srtp_subp.found()
-                srtp_dep = srtp_subp.get_variable('srtp2_dep')
-            endif
-        endif
-        if not srtp_dep.found()
-            message('libsrtp2 not found; building from deps/libsrtp')
-            srtp_dep = declare_dependency(
-                include_directories: include_directories(['deps/libsrtp/include', 'deps/libsrtp/crypto/include']),
-                link_args: [],
-            )
-        endif
+        srtp_dep = dependency('libsrtp2', fallback: ['libsrtp2', 'libsrtp2_dep'], required: true)
+    endif
+    # libsrtp2 pkg-config on many systems does not export includedir; wrap for safety
+    if srtp_dep.found() and srtp_dep.type_name() == 'pkgconfig'
+        _srtp_inc = include_directories('/usr/include/srtp2')
+        srtp_dep = declare_dependency(
+            dependencies: srtp_dep,
+            include_directories: _srtp_inc,
+        )
     endif
 endif
 
@@ -305,20 +276,7 @@ else
     if _use_system_juice
         ice_dep = dependency('libjuice', version: '>=1.7.0', required: true)
     else
-        ice_dep = dependency('libjuice', required: false)
-        if not ice_dep.found()
-            juice_subp = subproject('libjuice', required: false)
-            if juice_subp.found()
-                ice_dep = juice_subp.get_variable('libjuice_dep')
-            endif
-        endif
-        if not ice_dep.found()
-            message('libjuice not found; building from deps/libjuice')
-            ice_dep = declare_dependency(
-                include_directories: include_directories('deps/libjuice/include'),
-                link_args: [],
-            )
-        endif
+        ice_dep = dependency('libjuice', fallback: ['libjuice', 'libjuice_dep'], required: true)
     endif
 endif
 
@@ -342,10 +300,9 @@ if _sctp_debug
 endif
 
 if get_option('build_shared_libs')
-    lib_static_public_args = ['-DRTC_STATIC']
+    lib_shared_extra_args = []
 else
-    lib_static_public_args = ['-DRTC_STATIC']
-    lib_shared_public_args = ['-DRTC_STATIC']
+    lib_shared_extra_args = ['-DRTC_STATIC']
 endif
 
 # Public compile definitions (visible to consumers)
@@ -406,16 +363,30 @@ if not _no_media
 endif
 
 # ============================================================================
+# Compile options (from CMakeLists: -Wall -Wextra for non-MSVC)
+# Must be before any build target
+# ============================================================================
+if host_machine.system() != 'windows'
+    add_project_arguments('-Wall', '-Wextra', language: 'cpp')
+endif
+if _warnings_as_errors
+    add_project_arguments('-Werror', language: 'cpp')
+endif
+
+# ============================================================================
 # Library targets (from CMakeLists.txt: add_library(datachannel ...) + add_library(datachannel-static ...))
 # ============================================================================
+
+ace = dependency('ace')
 
 # Shared library
 lib_ace_rtc_shared = library(
     'ace_rtc',
     _all_sources,
     include_directories: [public_inc, private_inc],
-    cpp_args: lib_private_args + private_srtp_args,
+    cpp_args: lib_private_args + lib_public_args + lib_shared_extra_args + private_srtp_args,
     dependencies: [
+        ace,
         thread_dep,
         usrsctp_dep,
         plog_dep,
@@ -430,24 +401,10 @@ lib_ace_rtc_shared = library(
     install: true,
 )
 
-# Compile options (from CMakeLists: -Wall -Wextra for non-MSVC)
-if host_machine.system() != 'windows'
-    add_project_arguments('-Wall', '-Wextra', language: 'cpp')
-endif
-if _warnings_as_errors
-    add_project_arguments('-Werror', language: 'cpp')
-endif
-
-# ============================================================================
-# Declare dependency (preserved from existing meson.build)
-# ============================================================================
-ace = dependency('ace')
-
 ace_rtc_dep = declare_dependency(
     include_directories: public_inc,
-    dependencies: [ace, thread_dep],
     link_with: lib_ace_rtc_shared,
-    compile_args: lib_public_args,
+    compile_args: lib_public_args + lib_shared_extra_args,
 )
 
 meson.override_dependency('ace_rtc', ace_rtc_dep)
@@ -459,8 +416,9 @@ lib_ace_rtc_static = static_library(
     'ace_rtc_static',
     _all_sources,
     include_directories: [public_inc, private_inc],
-    cpp_args: lib_private_args + private_srtp_args,
+    cpp_args: lib_private_args + lib_public_args + private_srtp_args,
     dependencies: [
+        ace,
         thread_dep,
         usrsctp_dep,
         plog_dep,
@@ -471,13 +429,6 @@ lib_ace_rtc_static = static_library(
         win32_dep,
     ],
     install: true,
-)
-
-ace_rtc_static_dep = declare_dependency(
-    include_directories: public_inc,
-    dependencies: [ace, thread_dep],
-    link_with: lib_ace_rtc_static,
-    compile_args: lib_public_args + lib_static_public_args,
 )
 
 # ============================================================================
@@ -558,12 +509,7 @@ if not get_option('no_examples')
     if _use_system_json
         json_dep = dependency('nlohmann_json', required: true)
     else
-        json_dep = dependency('nlohmann_json', required: false)
-        if not json_dep.found()
-            json_dep = declare_dependency(
-                include_directories: include_directories('deps/json/single_include'),
-            )
-        endif
+        json_dep = dependency('nlohmann_json', fallback: ['nlohmann_json', 'nlohmann_json_dep'], required: true)
     endif
 
     # ---- copy-paste (offerer + answerer) ----
