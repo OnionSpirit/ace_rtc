@@ -27,7 +27,6 @@ _no_media = get_option('no_media')
 _no_websocket = get_option('no_websocket')
 _sctp_debug = get_option('sctp_debug')
 _use_nice = get_option('use_nice')
-_capi_stdcall = get_option('capi_stdcall')
 _warnings_as_errors = get_option('warnings_as_errors')
 
 # ============================================================================
@@ -67,7 +66,6 @@ libdatachannel_sources = files(
     'src/vp9rtpdepacketizer.cpp',
     'src/rtcpnackresponder.cpp',
     'src/rtp.cpp',
-    'src/capi.cpp',
     'src/plihandler.cpp',
     'src/pacinghandler.cpp',
     'src/rembhandler.cpp',
@@ -93,7 +91,6 @@ libdatachannel_headers = files(
     'include/rtc/frameinfo.hpp',
     'include/rtc/peerconnection.hpp',
     'include/rtc/reliability.hpp',
-    'include/rtc/rtc.h',
     'include/rtc/rtc.hpp',
     'include/rtc/rtp.hpp',
     'include/rtc/track.hpp',
@@ -121,7 +118,6 @@ libdatachannel_headers = files(
     'include/rtc/pacinghandler.hpp',
     'include/rtc/rembhandler.hpp',
     'include/rtc/rtcpapphandler.hpp',
-    'include/rtc/version.h',
 )
 
 # ============================================================================
@@ -316,10 +312,6 @@ else
     lib_public_args += ['-DRTC_ENABLE_MEDIA=1']
 endif
 
-if _capi_stdcall
-    lib_public_args += ['-DCAPI_STDCALL']
-endif
-
 # TLS compile definitions
 if _use_gnutls
     lib_private_args += ['-DUSE_GNUTLS=1']
@@ -401,6 +393,7 @@ ace_rtc_dep = declare_dependency(
     include_directories: public_inc,
     link_with: lib_ace_rtc_shared,
     compile_args: lib_public_args + lib_shared_extra_args,
+    dependencies: ace,
 )
 
 meson.override_dependency('ace_rtc', ace_rtc_dep)
@@ -458,11 +451,8 @@ if not get_option('no_tests')
         'test/turn_connectivity.cpp',
         'test/track.cpp',
         'test/video_layers_allocation.cpp',
-        'test/capi_connectivity.cpp',
-        'test/capi_track.cpp',
         'test/websocket.cpp',
         'test/websocketserver.cpp',
-        'test/capi_websocketserver.cpp',
         'test/benchmark.cpp',
         'test/test.hpp',
     )
@@ -522,21 +512,8 @@ if not get_option('no_examples')
         install: false,
     )
 
-    # ---- copy-paste-capi (C API: offerer.c + answerer.c) ----
-    executable(
-        'copy-paste-capi-offerer',
-        'examples/copy-paste-capi/offerer.c',
-        dependencies: [ace_rtc_dep],
-        install: false,
-    )
-    executable(
-        'copy-paste-capi-answerer',
-        'examples/copy-paste-capi/answerer.c',
-        dependencies: [ace_rtc_dep],
-        install: false,
-    )
-
     # ---- client (websocket) ----
+
     if not _no_websocket
         executable(
             'client',

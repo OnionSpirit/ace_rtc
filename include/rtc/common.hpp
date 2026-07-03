@@ -1,5 +1,6 @@
 /**
  * Copyright (c) 2019 Paul-Louis Ageneau
+ * Copyright (c) 2026 Ivan Moskalev (OnionSpirit)
  *
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -40,7 +41,63 @@
 #define RTC_ENABLE_MEDIA 1
 #endif
 
-#include "rtc.h" // for C API defines
+// PeerConnection state constants (used by enum class initializers)
+#define RTC_NEW 0
+#define RTC_CONNECTING 1
+#define RTC_CONNECTED 2
+#define RTC_DISCONNECTED 3
+#define RTC_FAILED 4
+#define RTC_CLOSED 5
+
+#define RTC_ICE_NEW 0
+#define RTC_ICE_CHECKING 1
+#define RTC_ICE_CONNECTED 2
+#define RTC_ICE_COMPLETED 3
+#define RTC_ICE_FAILED 4
+#define RTC_ICE_DISCONNECTED 5
+#define RTC_ICE_CLOSED 6
+
+#define RTC_GATHERING_NEW 0
+#define RTC_GATHERING_INPROGRESS 1
+#define RTC_GATHERING_COMPLETE 2
+
+#define RTC_SIGNALING_STABLE 0
+#define RTC_SIGNALING_HAVE_LOCAL_OFFER 1
+#define RTC_SIGNALING_HAVE_REMOTE_OFFER 2
+#define RTC_SIGNALING_HAVE_LOCAL_PRANSWER 3
+#define RTC_SIGNALING_HAVE_REMOTE_PRANSWER 4
+
+// Certificate type
+#define RTC_CERTIFICATE_DEFAULT 0
+#define RTC_CERTIFICATE_ECDSA 1
+#define RTC_CERTIFICATE_RSA 2
+
+// Transport policy
+#define RTC_TRANSPORT_POLICY_ALL 0
+#define RTC_TRANSPORT_POLICY_RELAY 1
+
+// Direction
+#define RTC_DIRECTION_UNKNOWN 0
+#define RTC_DIRECTION_SENDONLY 1
+#define RTC_DIRECTION_RECVONLY 2
+#define RTC_DIRECTION_SENDRECV 3
+#define RTC_DIRECTION_INACTIVE 4
+
+// NAL unit separator
+#define RTC_NAL_SEPARATOR_LENGTH 0
+#define RTC_NAL_SEPARATOR_LONG_START_SEQUENCE 1
+#define RTC_NAL_SEPARATOR_SHORT_START_SEQUENCE 2
+#define RTC_NAL_SEPARATOR_START_SEQUENCE 3
+
+// OBU packetization
+#define RTC_OBU_PACKETIZED_OBU 0
+#define RTC_OBU_PACKETIZED_TEMPORAL_UNIT 1
+
+// MTU and fragment size
+#define RTC_DEFAULT_MTU 1280
+#if RTC_ENABLE_MEDIA
+#define RTC_DEFAULT_MAX_FRAGMENT_SIZE ((uint16_t)(RTC_DEFAULT_MTU - 12 - 8 - 40))
+#endif
 
 #include "utils.hpp"
 

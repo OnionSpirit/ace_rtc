@@ -35,12 +35,12 @@ string err = co_await channel.onError();
 |---|------|--------|
 | 1 | Transport I/O → ACE (Tcp, TLS, DTLS, WS, Processor) | ✅ Done |
 | 2 | Channel coroutine API (receive/onOpen/onClose/onError) | ✅ Done |
-| 3 | PeerConnection → convert onXxx() to ace::async<> | 🔴 Pending |
-| 4 | WebSocketServer → convert onClient() to ace::async<> | 🔴 Pending |
-| 5 | C API (capi.cpp) → rewrite callbacks to channels | 🔴 Pending |
-| 6 | Remove legacy callbacks from impl::Channel | 🔴 Pending (after #5) |
+| 3 | PeerConnection → convert onXxx() to ace::async<> | ✅ Done |
+| 4 | WebSocketServer → convert onClient() to ace::async<> | ✅ Done |
+| 5 | C API (capi.cpp) → removed entirely | ✅ Done |
+| 6 | Remove legacy callbacks from impl::Channel | 🔴 Pending (blocked by examples/tests) |
 | 7 | ICE/libjuice → ace::net UDP | 🔴 Pending |
-| 8 | Fix unit tests | 🔴 Pending |
+| 8 | Fix unit tests + examples | 🔴 Pending |
 
 ---
 
@@ -253,7 +253,7 @@ rtc::WebSocketServer
 - `synchronized_callback<T>` should become `ace::futures::channel<T>` or similar
 - Thread safety: ACE is single-threaded per runner, but public API may be called from any thread
 
-### Increment 8: Fix unit tests
+### Increment 8: Fix unit tests + examples
 
 **Status**: NOT STARTED.
 
@@ -271,8 +271,19 @@ rtc::WebSocketServer
 - `test/benchmark.cpp`
 - `test/fir.cpp`, `test/rtx.cpp`, `test/rtcp_app.cpp` — media tests (only when RTC_ENABLE_MEDIA)
 
-Tests need updating after public API becomes coroutine-based. Will require:
-1. Adding `ace::run()` call or `rtc::RunAsync()` in test main
+**Example files** (`examples/` directory):
+- `examples/copy-paste/` — offerer/answerer (callback-based, need coroutine conversion)
+- `examples/copy-paste-capi/` — C API example (needs rewrite after #5)
+- `examples/client/` — WebRTC client
+- `examples/client-benchmark/` — benchmark client
+- `examples/media-sender/` — media sender
+- `examples/media-receiver/` — media receiver
+- `examples/media-sfu/` — media SFU
+- `examples/signaling-server-qt/` — Qt signaling server
+- `examples/streamer/` — media streamer
+
+Tests and examples need updating after public API becomes coroutine-based. Will require:
+1. Adding `ace::run()` call or `rtc::RunAsync()` in main
 2. Converting test callbacks to coroutine awaits
 3. Possibly restructuring test flow for coroutine-based API
 

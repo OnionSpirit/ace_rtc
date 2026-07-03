@@ -1,5 +1,6 @@
 /**
  * Copyright (c) 2019 Paul-Louis Ageneau
+ * Copyright (c) 2026 Ivan Moskalev (OnionSpirit)
  *
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -73,15 +74,6 @@ TestResult test_cleanup() {
 	}
 }
 
-TestResult test_capi_cleanup() {
-	try {
-		rtcCleanup();
-		return TestResult(true);
-	} catch (const exception &e) {
-		return TestResult(false, e.what());
-	}
-}
-
 static const vector<Test> tests = {
     // C++ API tests
     Test("WebRTC connectivity", test_connectivity),
@@ -116,15 +108,6 @@ static const vector<Test> tests = {
     Test("WebSocketServer", test_websocketserver),
 #endif
     Test("Cleanup", test_cleanup),
-    // C API tests
-    Test("WebRTC C API connectivity", test_capi_connectivity),
-#if RTC_ENABLE_MEDIA
-    Test("WebRTC C API track", test_capi_track),
-#endif
-#if RTC_ENABLE_WEBSOCKET
-    Test("WebSocketServer C API", test_capi_websocketserver),
-#endif
-    Test("C API cleanup", test_capi_cleanup),
 };
 
 int main(int argc, char **argv) {

@@ -1,5 +1,6 @@
 /**
  * Copyright (c) 2020-2021 Paul-Louis Ageneau
+ * Copyright (c) 2026 Ivan Moskalev (OnionSpirit)
  *
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -81,10 +82,13 @@ void WebSocketServer::runLoop() {
 				clientConfig.connectionTimeout = config.connectionTimeout;
 				clientConfig.maxMessageSize = config.maxMessageSize;
 
-				auto impl = std::make_shared<WebSocket>(std::move(clientConfig), mCertificate);
-				impl->changeState(WebSocket::State::Connecting);
-				impl->setTcpTransport(incoming);
-				clientCallback(std::make_shared<rtc::WebSocket>(impl));
+			auto impl = std::make_shared<WebSocket>(std::move(clientConfig), mCertificate);
+			impl->changeState(WebSocket::State::Connecting);
+			impl->setTcpTransport(incoming);
+			auto ws = std::make_shared<rtc::WebSocket>(impl);
+			if (clientCallback)
+				clientCallback(ws);
+			clientAceChannel->push(ws);
 
 			} catch (const std::exception &e) {
 				PLOG_ERROR << "WebSocketServer: " << e.what();

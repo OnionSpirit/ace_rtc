@@ -1,5 +1,6 @@
 /**
  * Copyright (c) 2021 Paul-Louis Ageneau
+ * Copyright (c) 2026 Ivan Moskalev (OnionSpirit)
  *
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -29,6 +30,10 @@ uint16_t WebSocketServer::port() const { return impl()->tcpServer->port(); }
 
 void WebSocketServer::onClient(std::function<void(shared_ptr<WebSocket>)> callback) {
 	impl()->clientCallback = callback;
+}
+
+ace::async<shared_ptr<WebSocket>> WebSocketServer::acceptClient() {
+	co_return co_await impl()->clientAceChannel->pull();
 }
 
 } // namespace rtc

@@ -1,5 +1,6 @@
 /**
  * Copyright (c) 2020-2021 Paul-Louis Ageneau
+ * Copyright (c) 2026 Ivan Moskalev (OnionSpirit)
  *
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -21,6 +22,8 @@
 #include "rtc/websocket.hpp"
 #include "rtc/websocketserver.hpp"
 
+#include <ace/futures/channel.h>
+
 #include <atomic>
 #include <thread>
 
@@ -37,6 +40,8 @@ struct WebSocketServer final : public std::enable_shared_from_this<WebSocketServ
 	const Configuration config;
 	unique_ptr<TcpServer> tcpServer;
 	synchronized_callback<shared_ptr<rtc::WebSocket>> clientCallback;
+	std::shared_ptr<ace::futures::channel<shared_ptr<rtc::WebSocket>>> clientAceChannel =
+	    std::make_shared<ace::futures::channel<shared_ptr<rtc::WebSocket>>>();
 
 private:
 	const init_token mInitToken = Init::Instance().token();

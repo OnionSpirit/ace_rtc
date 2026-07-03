@@ -1,5 +1,6 @@
 /**
  * Copyright (c) 2019 Paul-Louis Ageneau
+ * Copyright (c) 2026 Ivan Moskalev (OnionSpirit)
  *
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -16,6 +17,8 @@
 #include "description.hpp"
 #include "reliability.hpp"
 #include "track.hpp"
+
+#include <ace/core/async.h>
 
 #include <chrono>
 #include <functional>
@@ -121,6 +124,16 @@ public:
 	void onIceStateChange(std::function<void(IceState state)> callback);
 	void onGatheringStateChange(std::function<void(GatheringState state)> callback);
 	void onSignalingStateChange(std::function<void(SignalingState state)> callback);
+
+	// Coroutine event streams (ACE-based)
+	ace::async<State> stateChange();
+	ace::async<IceState> iceStateChange();
+	ace::async<GatheringState> gatheringStateChange();
+	ace::async<SignalingState> signalingStateChange();
+	ace::async<optional<Description>> localDescriptionChange();
+	ace::async<optional<Candidate>> localCandidateChange();
+	ace::async<shared_ptr<DataChannel>> dataChannelChange();
+	ace::async<shared_ptr<Track>> trackChange();
 
 	void resetCallbacks();
 	CertificateFingerprint remoteFingerprint();

@@ -1,5 +1,6 @@
 /**
  * Copyright (c) 2021 Paul-Louis Ageneau
+ * Copyright (c) 2026 Ivan Moskalev (OnionSpirit)
  *
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -14,6 +15,8 @@
 #include "common.hpp"
 #include "configuration.hpp"
 #include "websocket.hpp"
+
+#include <ace/core/async.h>
 
 namespace rtc {
 
@@ -36,6 +39,9 @@ public:
 	uint16_t port() const;
 
 	void onClient(std::function<void(shared_ptr<WebSocket>)> callback);
+
+	// Coroutine API: await next accepted client
+	ace::async<shared_ptr<WebSocket>> acceptClient();
 
 private:
 	using CheshireCat<impl::WebSocketServer>::impl;

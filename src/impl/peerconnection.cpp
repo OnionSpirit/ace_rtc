@@ -1,6 +1,7 @@
 /**
  * Copyright (c) 2019 Paul-Louis Ageneau
  * Copyright (c) 2020 Filip Klembara (in2core)
+ * Copyright (c) 2026 Ivan Moskalev (OnionSpirit)
  *
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -1103,6 +1104,7 @@ void PeerConnection::processLocalDescription(Description description) {
 
 	mProcessor.enqueue(&PeerConnection::trigger<Description>, shared_from_this(),
 	                   &localDescriptionCallback, std::move(description));
+	localDescriptionAceChannel->push(description);
 }
 
 void PeerConnection::processLocalCandidate(Candidate candidate) {
@@ -1123,6 +1125,7 @@ void PeerConnection::processLocalCandidate(Candidate candidate) {
 
 	mProcessor.enqueue(&PeerConnection::trigger<Candidate>, shared_from_this(),
 	                   &localCandidateCallback, std::move(candidate));
+	localCandidateAceChannel->push(std::move(candidate));
 }
 
 void PeerConnection::processRemoteDescription(Description description) {
@@ -1311,7 +1314,7 @@ void PeerConnection::triggerTrack(weak_ptr<Track> weakTrack) {
 }
 
 void PeerConnection::triggerPendingDataChannels() {
-	while (dataChannelCallback) {
+	while (true) {
 		auto next = mPendingDataChannels.pop();
 		if (!next)
 			break;
@@ -1319,7 +1322,10 @@ void PeerConnection::triggerPendingDataChannels() {
 		auto impl = std::move(*next);
 
 		try {
-			dataChannelCallback(std::make_shared<rtc::DataChannel>(impl));
+			auto dc = std::make_shared<rtc::DataChannel>(impl);
+			if (dataChannelCallback)
+				dataChannelCallback(dc);
+			dataChannelAceChannel->push(dc);
 		} catch (const std::exception &e) {
 			PLOG_WARNING << "Uncaught exception in callback: " << e.what();
 		}
@@ -1329,7 +1335,7 @@ void PeerConnection::triggerPendingDataChannels() {
 }
 
 void PeerConnection::triggerPendingTracks() {
-	while (trackCallback) {
+	while (true) {
 		auto next = mPendingTracks.pop();
 		if (!next)
 			break;
@@ -1337,13 +1343,16 @@ void PeerConnection::triggerPendingTracks() {
 		auto impl = std::move(*next);
 
 		try {
-			trackCallback(std::make_shared<rtc::Track>(impl));
+			auto tr = std::make_shared<rtc::Track>(impl);
+			if (trackCallback)
+				trackCallback(tr);
+			trackAceChannel->push(tr);
 		} catch (const std::exception &e) {
 			PLOG_WARNING << "Uncaught exception in callback: " << e.what();
 		}
+	}
 
 		// Do not trigger open immediately for tracks as it'll be done later
-	}
 }
 
 void PeerConnection::flushPendingDataChannels() {
@@ -1376,6 +1385,7 @@ bool PeerConnection::changeState(State newState) {
 		mProcessor.enqueue(&PeerConnection::trigger<State>, shared_from_this(),
 		                   &stateChangeCallback, newState);
 	}
+	stateAceChannel->push(newState);
 	return true;
 }
 
@@ -1394,6 +1404,7 @@ bool PeerConnection::changeIceState(IceState newState) {
 		mProcessor.enqueue(&PeerConnection::trigger<IceState>, shared_from_this(),
 		                   &iceStateChangeCallback, newState);
 	}
+	iceStateAceChannel->push(newState);
 	return true;
 }
 
@@ -1406,7 +1417,7 @@ bool PeerConnection::changeGatheringState(GatheringState newState) {
 	PLOG_INFO << "Changed gathering state to " << s.str();
 	mProcessor.enqueue(&PeerConnection::trigger<GatheringState>, shared_from_this(),
 	                   &gatheringStateChangeCallback, newState);
-
+	gatheringStateAceChannel->push(newState);
 	return true;
 }
 
@@ -1419,7 +1430,7 @@ bool PeerConnection::changeSignalingState(SignalingState newState) {
 	PLOG_INFO << "Changed signaling state to " << s.str();
 	mProcessor.enqueue(&PeerConnection::trigger<SignalingState>, shared_from_this(),
 	                   &signalingStateChangeCallback, newState);
-
+	signalingStateAceChannel->push(newState);
 	return true;
 }
 
@@ -1433,6 +1444,9 @@ void PeerConnection::resetCallbacks() {
 	gatheringStateChangeCallback = nullptr;
 	signalingStateChangeCallback = nullptr;
 	trackCallback = nullptr;
+	// Push terminal values to ACE channels
+	localDescriptionAceChannel->push(nullopt);
+	localCandidateAceChannel->push(nullopt);
 }
 
 CertificateFingerprint PeerConnection::remoteFingerprint() {

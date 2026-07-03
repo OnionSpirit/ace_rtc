@@ -1,6 +1,7 @@
 /**
  * Copyright (c) 2019 Paul-Louis Ageneau
  * Copyright (c) 2020 Filip Klembara (in2core)
+ * Copyright (c) 2026 Ivan Moskalev (OnionSpirit)
  *
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -379,6 +380,44 @@ void PeerConnection::onGatheringStateChange(std::function<void(GatheringState st
 
 void PeerConnection::onSignalingStateChange(std::function<void(SignalingState state)> callback) {
 	impl()->signalingStateChangeCallback = callback;
+}
+
+// --- Coroutine event streams ---
+
+ace::async<PeerConnection::State> PeerConnection::stateChange() {
+	co_return co_await impl()->stateAceChannel->pull();
+}
+
+ace::async<PeerConnection::IceState> PeerConnection::iceStateChange() {
+	co_return co_await impl()->iceStateAceChannel->pull();
+}
+
+ace::async<PeerConnection::GatheringState> PeerConnection::gatheringStateChange() {
+	co_return co_await impl()->gatheringStateAceChannel->pull();
+}
+
+ace::async<PeerConnection::SignalingState> PeerConnection::signalingStateChange() {
+	co_return co_await impl()->signalingStateAceChannel->pull();
+}
+
+ace::async<optional<Description>> PeerConnection::localDescriptionChange() {
+	auto desc = co_await impl()->localDescriptionAceChannel->pull();
+	if (!desc) co_return nullopt;
+	co_return std::move(*desc);
+}
+
+ace::async<optional<Candidate>> PeerConnection::localCandidateChange() {
+	auto cand = co_await impl()->localCandidateAceChannel->pull();
+	if (!cand) co_return nullopt;
+	co_return std::move(*cand);
+}
+
+ace::async<shared_ptr<DataChannel>> PeerConnection::dataChannelChange() {
+	co_return co_await impl()->dataChannelAceChannel->pull();
+}
+
+ace::async<shared_ptr<Track>> PeerConnection::trackChange() {
+	co_return co_await impl()->trackAceChannel->pull();
 }
 
 void PeerConnection::resetCallbacks() { impl()->resetCallbacks(); }

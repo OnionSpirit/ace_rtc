@@ -15,6 +15,4 @@ option('no_media', type: 'boolean', value: false, description: 'Disable media tr
 option('no_examples', type: 'boolean', value: false, description: 'Disable examples')
 option('no_tests', type: 'boolean', value: false, description: 'Disable tests build')
 option('warnings_as_errors', type: 'boolean', value: false, description: 'Treat warnings as errors')
-option('capi_stdcall', type: 'boolean', value: false, description: 'Set calling convention of C API callbacks stdcall')
 option('sctp_debug', type: 'boolean', value: false, description: 'Enable SCTP debugging output')
-option('rtc_update_version_header', type: 'boolean', value: false, description: 'Enable updating the version header')
