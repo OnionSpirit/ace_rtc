@@ -232,15 +232,11 @@ endif
 
 # TLS backend
 tls_dep = dependency('', required: false)
-_tls_name = ''
 if _use_gnutls
-    _tls_name = 'gnutls'
     tls_dep = dependency('gnutls', required: true)
 elif _use_mbedtls
-    _tls_name = 'mbedtls'
     tls_dep = dependency('mbedtls', required: true)
 else
-    _tls_name = 'openssl'
     tls_dep = dependency('openssl', required: true)
 endif
 
