@@ -37,10 +37,11 @@ string err = co_await channel.onError();
 | 2 | Channel coroutine API (receive/onOpen/onClose/onError) | ✅ Done |
 | 3 | PeerConnection → convert onXxx() to ace::async<> | ✅ Done |
 | 4 | WebSocketServer → convert onClient() to ace::async<> | ✅ Done |
-| 5 | C API (capi.cpp) → removed entirely | ✅ Done |
-| 6 | Remove legacy callbacks from impl::Channel | 🔴 Pending (blocked by examples/tests) |
-| 7 | ICE/libjuice → ace::net UDP | 🔴 Pending |
-| 8 | Fix unit tests + examples | 🔴 Pending |
+| 5 | C API → removed entirely | ✅ Done |
+| 6 | Remove legacy callbacks from impl::Channel | 🔴 Pending |
+| 7 | ICE/libjuice → удалить, писать чистый ace::net ICE/STUN/TURN | 🔴 Pending |
+| 8 | Fix examples (build) | ✅ Done |
+| 9 | Convert tests + examples → coroutine API | 🔴 Pending |
 
 ---
 
@@ -152,21 +153,23 @@ int main() {
 
 ## Pending Migration
 
-### Increment 6: ICE/libjuice → ace::net UDP
+### Increment 7: ICE/libjuice → ace::net UDP
 
-**Status**: NOT STARTED. Most complex increment.
+**Status**: ANALYZED. Decision: **remove libjuice entirely, use pure ace::net**.
 
-**Scope**: libjuice handles ICE/STUN/TURN protocol over UDP sockets. To replace with ace::net:
-1. `IceTransport` wraps libjuice's C API. Replacement requires either:
-   - (a) Reimplement ICE/STUN/TURN protocol using `ace::net::net_interface` (sendto/recv)
-   - (b) Modify libjuice to use ace::net sockets instead of its own poll/epoll loop
-2. Option (a) is preferred but requires significant protocol-level work
-3. `ace::net::net_interface` = `transport_entity<AF_INET, e_indirect>` — supports `sendto()`/`recv()`
+**Rationale**: libjuice — C11 ICE/STUN/TURN library. Its C headers are incompatible with C++23. The road ahead:
+1. Implement ICE agent directly on `ace::net::net_interface` (UDP sendto/recv via io_uring)
+2. Implement STUN/TURN protocol in C++ (or port from libjuice's `stun.c`/`turn.c`)
+3. Replace `IceTransport` → new `AceIceTransport` using pure ace::net
+4. Remove `libjuice` subproject entirely
 
-**Affected files**:
-- `src/impl/icetransport.hpp`, `src/impl/icetransport.cpp`
-- `src/impl/iceudpmuxlistener.hpp`, `src/impl/iceudpmuxlistener.cpp`
-- Possibly `deps/libjuice/` if option (b) is chosen
+**Size**: ~8000 lines of protocol code to implement/port (ICE state machine, STUN binding, TURN relay, candidate gathering, SDP generation)
+
+**Existing groundwork**:
+- `deps/libjuice/src/conn_ace.cpp` — reference implementation of ACE I/O loop pattern
+- `JUICE_CONCURRENCY_MODE_ACE` enum added to `juice.h`
+- `conn_ace_registry_init()` completed — socket creation + net_interface wrapping pattern known
+- Full analysis of libjuice internals completed (see commit history)
 
 ### Increment 7: Public API → coroutines
 
