@@ -15,7 +15,6 @@
 #include <chrono>
 #include <future>
 #include <mutex>
-#include <thread>
 
 namespace rtc::impl {
 
@@ -51,7 +50,6 @@ private:
 	unsigned int mThreadPoolSize = 0;
 	std::mutex mMutex;
 	std::shared_future<void> mCleanupFuture;
-	std::thread mAceDispatcherThread;
 
 	struct TokenPayload;
 };

@@ -1,5 +1,6 @@
 /**
  * Copyright (c) 2020-2021 Paul-Louis Ageneau
+ * Copyright (c) 2024 ACE migration
  *
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -20,6 +21,7 @@
 #endif
 
 #include <atomic>
+#include <functional>
 #include <shared_mutex>
 
 namespace rtc::impl {
@@ -77,7 +79,6 @@ private:
 	std::atomic<bool> mIsClosed = false;
 
 	Queue<message_ptr> mRecvQueue;
-
 };
 
 } // namespace rtc::impl

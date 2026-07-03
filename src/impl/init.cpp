@@ -133,12 +133,6 @@ void Init::doInit() {
 	PLOG_DEBUG << "Spawning " << count << " threads";
 	ThreadPool::Instance().spawn(count);
 
-	PLOG_DEBUG << "Starting ACE dispatcher";
-	mAceDispatcherThread = std::thread([]() {
-		utils::this_thread::set_name("RTC ace");
-		ace::run();
-	});
-
 #if RTC_ENABLE_WEBSOCKET
 	PollService::Instance().start();
 #endif
@@ -187,11 +181,6 @@ void Init::doCleanup() {
 #if RTC_ENABLE_MEDIA
 	DtlsSrtpTransport::Cleanup();
 #endif
-	PLOG_DEBUG << "Stopping ACE dispatcher";
-	ace::terminate();
-	if (mAceDispatcherThread.joinable())
-		mAceDispatcherThread.join();
-
 	IceTransport::Cleanup();
 
 #ifdef _WIN32

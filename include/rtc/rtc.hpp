@@ -18,6 +18,20 @@
 #include "peerconnection.hpp"
 #include "track.hpp"
 
+namespace rtc {
+
+// ACE event loop management.
+// For ACE-native applications: call ace::run() in your main thread.
+// For non-ACE applications: call rtc::Run() to start the event loop.
+// rtc::RunAsync() starts ace::run() in a background thread.
+// rtc::Stop() signals the event loop to terminate.
+
+void Run();       // Blocking: calls ace::run() in the calling thread
+void RunAsync();  // Non-blocking: spawns a thread with ace::run()
+void Stop();      // Signals ace::terminate()
+
+} // namespace rtc
+
 #if RTC_ENABLE_WEBSOCKET
 
 // WebSocket

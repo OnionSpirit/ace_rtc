@@ -919,7 +919,7 @@ int rtcReceiveMessage(int id, char *buffer, int *size) {
 			        if (ret >= 0) {
 				        *size = ret;
 				        if (buffer) {
-					        channel->receive(); // discard
+					        channel->receiveSync(); // discard
 				        }
 
 				        return RTC_ERR_SUCCESS;
@@ -933,7 +933,7 @@ int rtcReceiveMessage(int id, char *buffer, int *size) {
 			        if (ret >= 0) {
 				        *size = -ret;
 				        if (buffer) {
-					        channel->receive(); // discard
+					        channel->receiveSync(); // discard
 				        }
 
 				        return RTC_ERR_SUCCESS;

@@ -18,7 +18,10 @@
 
 #include "impl/init.hpp"
 
+#include <ace/core/dispatcher.h>
+
 #include <mutex>
+#include <thread>
 
 namespace {
 
@@ -88,6 +91,21 @@ void SetSctpSettings(SctpSettings s) { impl::Init::Instance().setSctpSettings(st
 
 bool Preload() { return impl::Init::Instance().preload(); }
 std::shared_future<void> Cleanup() { return impl::Init::Instance().cleanup(); }
+
+void Run() {
+	impl::Init::Instance().preload();
+	ace::run();
+}
+
+void RunAsync() {
+	impl::Init::Instance().preload();
+	static std::thread sAceThread([]() { ace::run(); });
+	(void)sAceThread;
+}
+
+void Stop() {
+	ace::terminate();
+}
 
 std::ostream &operator<<(std::ostream &out, LogLevel level) {
 	switch (level) {

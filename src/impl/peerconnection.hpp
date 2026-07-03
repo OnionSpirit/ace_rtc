@@ -18,6 +18,8 @@
 #include "sctptransport.hpp"
 #include "track.hpp"
 
+#include <ace/futures/channel.h>
+
 #include "rtc/peerconnection.hpp"
 
 #include <mutex>
@@ -104,6 +106,24 @@ struct PeerConnection : std::enable_shared_from_this<PeerConnection> {
 	void resetCallbacks();
 
 	CertificateFingerprint remoteFingerprint();
+
+	// ACE coroutine channels for public API events
+	std::shared_ptr<ace::futures::channel<shared_ptr<rtc::DataChannel>>> dataChannelAceChannel =
+	    std::make_shared<ace::futures::channel<shared_ptr<rtc::DataChannel>>>();
+	std::shared_ptr<ace::futures::channel<optional<Description>>> localDescriptionAceChannel =
+	    std::make_shared<ace::futures::channel<optional<Description>>>();
+	std::shared_ptr<ace::futures::channel<optional<Candidate>>> localCandidateAceChannel =
+	    std::make_shared<ace::futures::channel<optional<Candidate>>>();
+	std::shared_ptr<ace::futures::channel<State>> stateAceChannel =
+	    std::make_shared<ace::futures::channel<State>>();
+	std::shared_ptr<ace::futures::channel<IceState>> iceStateAceChannel =
+	    std::make_shared<ace::futures::channel<IceState>>();
+	std::shared_ptr<ace::futures::channel<GatheringState>> gatheringStateAceChannel =
+	    std::make_shared<ace::futures::channel<GatheringState>>();
+	std::shared_ptr<ace::futures::channel<SignalingState>> signalingStateAceChannel =
+	    std::make_shared<ace::futures::channel<SignalingState>>();
+	std::shared_ptr<ace::futures::channel<shared_ptr<rtc::Track>>> trackAceChannel =
+	    std::make_shared<ace::futures::channel<shared_ptr<rtc::Track>>>();
 
 	// Helper method for asynchronous callback invocation
 	template <typename... Args> void trigger(synchronized_callback<Args...> *cb, Args... args) {
