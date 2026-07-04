@@ -11,7 +11,6 @@ project(
 # ============================================================================
 _prefer_system = get_option('prefer_system_lib')
 _use_system_srtp = get_option('use_system_srtp') or _prefer_system
-_use_system_juice = get_option('use_system_juice') or _prefer_system
 _use_system_usrsctp = get_option('use_system_usrsctp') or _prefer_system
 _use_system_plog = get_option('use_system_plog') or _prefer_system
 _use_system_json = get_option('use_system_json') or _prefer_system
@@ -26,7 +25,6 @@ endif
 _no_media = get_option('no_media')
 _no_websocket = get_option('no_websocket')
 _sctp_debug = get_option('sctp_debug')
-_use_nice = get_option('use_nice')
 _warnings_as_errors = get_option('warnings_as_errors')
 
 # ============================================================================
@@ -260,17 +258,7 @@ if not _no_media
     endif
 endif
 
-# ICE transport: libjuice or libnice
-ice_dep = dependency('', required: false)
-if _use_nice
-    ice_dep = dependency('nice', required: true)
-else
-    if _use_system_juice
-        ice_dep = dependency('libjuice', version: '>=1.7.0', required: true)
-    else
-        ice_dep = dependency('libjuice', fallback: ['libjuice', 'libjuice_dep'], required: true)
-    endif
-endif
+# ICE transport: pure ace::net (no external ICE library needed)
 
 # Windows winsock2
 win32_dep = dependency('', required: false)
@@ -321,17 +309,7 @@ else
     lib_private_args += ['-DUSE_GNUTLS=0']
 endif
 
-# ICE compile definitions
-if _use_nice
-    lib_private_args += ['-DUSE_NICE=1']
-else
-    lib_private_args += ['-DUSE_NICE=0']
-    if _use_system_juice
-        lib_private_args += ['-DRTC_SYSTEM_JUICE=1']
-    else
-        lib_private_args += ['-DRTC_SYSTEM_JUICE=0']
-    endif
-endif
+# ICE: pure ace::net (no external ICE library)
 
 # Build shared libs option mirroring (CMake props: CXX_VISIBILITY_PRESET default)
 if host_machine.system() == 'windows'
@@ -381,7 +359,6 @@ lib_ace_rtc_shared = library(
         tls_dep,
         nettle_dep,
         srtp_dep,
-        ice_dep,
         win32_dep,
     ],
     version: meson.project_version(),
@@ -414,7 +391,6 @@ lib_ace_rtc_static = static_library(
         tls_dep,
         nettle_dep,
         srtp_dep,
-        ice_dep,
         win32_dep,
     ],
     install: true,

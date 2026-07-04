@@ -1,5 +1,6 @@
 /**
  * Copyright (c) 2019-2020 Paul-Louis Ageneau
+ * Copyright (c) 2026 Ivan Moskalev (OnionSpirit)
  *
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -14,19 +15,23 @@
 #include "configuration.hpp"
 #include "description.hpp"
 #include "global.hpp"
+#include "iceprotocol.hpp"
 #include "peerconnection.hpp"
+#include "stunprotocol.hpp"
 #include "transport.hpp"
+#include "turnprotocol.hpp"
 
-#if !USE_NICE
-#include <juice/juice.h>
-#else
-#include <nice/agent.h>
-#endif
+#include <ace/net.h>
+#include <ace/futures/timeout.h>
+#include <ace/futures/channel.h>
+#include <ace/core/async.h>
+#include <ace/core/dispatcher.h>
 
 #include <atomic>
-#include <chrono>
+#include <memory>
 #include <mutex>
-#include <thread>
+#include <optional>
+#include <vector>
 
 namespace rtc::impl {
 
@@ -56,7 +61,7 @@ public:
 	optional<string> getLocalAddress() const;
 	optional<string> getRemoteAddress() const;
 
-	bool send(message_ptr message) override; // false if dropped
+	bool send(message_ptr message) override;
 
 	bool getSelectedCandidatePair(Candidate *local, Candidate *remote);
 
@@ -64,62 +69,73 @@ private:
 	bool outgoing(message_ptr message) override;
 
 	void changeGatheringState(GatheringState state);
-
-	void processStateChange(unsigned int state);
 	void processCandidate(const string &candidate);
 	void processGatheringDone();
-	void processTimeout();
 
-	void addIceServer(IceServer server);
+	void addIceServer(const IceServer &server);
+
+	// ICE protocol
+	void initIceParameters(string uFrag, string pwd);
+	void gatherHostCandidates();
+	void gatherSrflxCandidates(const string &stunHost, uint16_t stunPort);
+	void gatherRelayCandidates(const IceServer &server);
+	void scheduleChecks();
+
+	bool sendStunMessage(const ice::AddrRecord &dst, const stun::StunMessage &msg,
+	                     const char *password = nullptr);
+	int sendRaw(const ice::AddrRecord &dst, const void *data, size_t size);
+
+	// I/O loop
+	ace::task ioLoop();
+
+	// Internal types
+	struct IceCheck {
+		ice::IceCandidatePair *pair = nullptr;
+		std::array<uint8_t, stun::STUN_TRANSACTION_ID_SIZE> transaction_id{};
+		int retransmits = 0;
+		int64_t next_retransmit = 0;
+		bool is_stun_binding = false;
+	};
+
+	struct TurnCtx {
+		std::string hostname;
+		uint16_t port = 0;
+		std::string username;
+		std::string password;
+		ice::AddrRecord resolved_addr;
+		ice::AddrRecord relayed_addr;
+		turn::TurnMap turn_map;
+		int64_t allocation_expiry = 0;
+		int64_t permission_expiry = 0;
+		uint16_t data_channel = 0;
+		bool allocated = false;
+	};
 
 	Description::Role mRole;
 	string mMid;
-	std::chrono::milliseconds mTrickleTimeout;
 	std::atomic<GatheringState> mGatheringState;
-
 	candidate_callback mCandidateCallback;
 	gathering_state_callback mGatheringStateChangeCallback;
 
-#if !USE_NICE
-	unique_ptr<juice_agent_t, void (*)(juice_agent_t *)> mAgent;
-	int mTurnServersAdded = 0;
+	ice::IceDescription mLocalDescription;
+	ice::IceDescription mRemoteDescription;
+	std::vector<ice::IceCandidate> mLocalCandidates;
+	std::vector<ice::IceCandidate> mRemoteCandidates;
+	std::vector<ice::IceCandidatePair> mPairs;
+	ice::IceCandidatePair *mSelectedPair = nullptr;
 
-	static void StateChangeCallback(juice_agent_t *agent, juice_state_t state, void *user_ptr);
-	static void CandidateCallback(juice_agent_t *agent, const char *sdp, void *user_ptr);
-	static void GatheringDoneCallback(juice_agent_t *agent, void *user_ptr);
-	static void RecvCallback(juice_agent_t *agent, const char *data, size_t size, void *user_ptr);
-	static void LogCallback(juice_log_level_t level, const char *message);
-#else
-	class MainLoopWrapper {
-	public:
-		MainLoopWrapper();
-		~MainLoopWrapper();
-		GMainLoop *get() const;
+	bool mIsControlling = false;
+	uint64_t mTiebreaker = 0;
 
-	private:
-		unique_ptr<GMainLoop, void (*)(GMainLoop *)> mMainLoop;
-		std::thread mThread;
-	};
-	static MainLoopWrapper *MainLoop;
+	std::vector<TurnCtx> mTurnServers;
+	std::vector<IceCheck> mPendingChecks;
 
-	unique_ptr<NiceAgent, void (*)(NiceAgent *)> mNiceAgent;
-	uint32_t mStreamId = 0;
-	guint mTimeoutId = 0;
-	std::mutex mOutgoingMutex;
-	unsigned int mOutgoingDscp;
+	std::unique_ptr<ace::net::net_interface> mNetIface;
+	int mSocketFd = -1;
+	std::mutex mSendMutex;
 
-	static string AddressToString(const NiceAddress &addr);
-
-	static void CandidateCallback(NiceAgent *agent, NiceCandidate *candidate, gpointer userData);
-	static void GatheringDoneCallback(NiceAgent *agent, guint streamId, gpointer userData);
-	static void StateChangeCallback(NiceAgent *agent, guint streamId, guint componentId,
-	                                guint state, gpointer userData);
-	static void RecvCallback(NiceAgent *agent, guint stream_id, guint component_id, guint len,
-	                         gchar *buf, gpointer userData);
-	static gboolean TimeoutCallback(gpointer userData);
-	static void LogCallback(const gchar *log_domain, GLogLevelFlags log_level, const gchar *message,
-	                        gpointer user_data);
-#endif
+	std::atomic<bool> mRunning{true};
+	Configuration mConfig;
 };
 
 } // namespace rtc::impl

@@ -1,6 +1,7 @@
 /**
  * Copyright (c) 2025 Alex Potsides
  * Copyright (c) 2025 Paul-Louis Ageneau
+ * Copyright (c) 2026 Ivan Moskalev (OnionSpirit)
  *
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -14,11 +15,14 @@
 
 #include "rtc/iceudpmuxlistener.hpp"
 
-#if !USE_NICE
-#include <juice/juice.h>
-#endif
+#include <ace/net.h>
+#include <ace/futures/timeout.h>
+#include <ace/core/async.h>
+#include <ace/core/dispatcher.h>
 
 #include <atomic>
+#include <memory>
+#include <mutex>
 
 namespace rtc::impl {
 
@@ -32,14 +36,16 @@ struct IceUdpMuxListener final {
 	synchronized_callback<IceUdpMuxRequest> unhandledStunRequestCallback;
 
 private:
-#if !USE_NICE
-	static void UnhandledStunRequestCallback(const juice_mux_binding_request *info, void *user_ptr);
-#endif
+	void onStunRequest(const char *local_ufrag, const char *remote_ufrag,
+	                   const char *address, uint16_t remote_port);
 
+	ace::task muxIoLoop();
+
+	std::unique_ptr<ace::net::net_interface> mNetIface;
+	int mSocketFd = -1;
 	std::atomic<bool> mStopped;
 };
 
-}
+} // namespace rtc::impl
 
 #endif
-

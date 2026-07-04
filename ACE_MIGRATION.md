@@ -39,7 +39,7 @@ string err = co_await channel.onError();
 | 4 | WebSocketServer → convert onClient() to ace::async<> | ✅ Done |
 | 5 | C API → removed entirely | ✅ Done |
 | 6 | Remove legacy callbacks from impl::Channel | 🔴 Pending |
-| 7 | ICE/libjuice → удалить, писать чистый ace::net ICE/STUN/TURN | 🔴 Pending |
+| 7 | ICE/libjuice → удалить, писать чистый ace::net ICE/STUN/TURN | ✅ Done |
 | 8 | Fix examples (build) | ✅ Done |
 | 9 | Convert tests + examples → coroutine API | 🔴 Pending |
 
@@ -153,25 +153,24 @@ int main() {
 
 ## Pending Migration
 
-### Increment 7: ICE/libjuice → ace::net UDP
+### Increment 7: ICE/libjuice → ace::net UDP — DONE
 
-**Status**: ANALYZED. Decision: **remove libjuice entirely, use pure ace::net**.
+**Status**: COMPLETE. Pure ace::net ICE/STUN/TURN implementation.
 
-**Rationale**: libjuice — C11 ICE/STUN/TURN library. Its C headers are incompatible with C++23. The road ahead:
-1. Implement ICE agent directly on `ace::net::net_interface` (UDP sendto/recv via io_uring)
-2. Implement STUN/TURN protocol in C++ (or port from libjuice's `stun.c`/`turn.c`)
-3. Replace `IceTransport` → new `AceIceTransport` using pure ace::net
-4. Remove `libjuice` subproject entirely
+**What was done**:
+1. Wrote `src/impl/stuncrypto.hpp` — CRC32, SHA1, SHA256, MD5, HMAC-SHA1/SHA256, base64, random, constant-time memcmp (supports OpenSSL/GnuTLS/MbedTLS)
+2. Wrote `src/impl/stunprotocol.hpp` — Full STUN message encode/decode (RFC 5389/8489) with integrity checking, XOR-mapped addresses, fingerprint, ICE attributes
+3. Wrote `src/impl/turnprotocol.hpp` — TURN channel/permission map (RFC 5766/8656) with open-addressing hash map
+4. Wrote `src/impl/iceprotocol.hpp` — ICE SDP parsing/generation, candidate priority computation (RFC 8445), pair state management
+5. Rewrote `src/impl/icetransport.hpp` — Replaced `juice_agent_t` with `ace::net::net_interface` + ICE protocol structs
+6. Rewrote `src/impl/icetransport.cpp` — Full ACE coroutine-based ICE agent: UDP I/O via io_uring, STUN binding/connectivity checks, TURN allocate/refresh, candidate gathering, nomination
+7. Rewrote `src/impl/iceudpmuxlistener.hpp/cpp` — ACE-net based STUN mux listener
+8. Updated `meson.build` — Removed libjuice dependency entirely
+9. Removed `deps/libjuice/` and `subprojects/libjuice.wrap`
 
-**Size**: ~8000 lines of protocol code to implement/port (ICE state machine, STUN binding, TURN relay, candidate gathering, SDP generation)
+**Removed**: libjuice C11 source (~8000 lines), libjuice subproject
 
-**Existing groundwork**:
-- `deps/libjuice/src/conn_ace.cpp` — reference implementation of ACE I/O loop pattern
-- `JUICE_CONCURRENCY_MODE_ACE` enum added to `juice.h`
-- `conn_ace_registry_init()` completed — socket creation + net_interface wrapping pattern known
-- Full analysis of libjuice internals completed (see commit history)
-
-### Increment 7: Public API → coroutines
+### Increment 8: Public API → coroutines
 
 **Status**: DONE (hybrid approach). C API still uses legacy callbacks.
 
@@ -348,7 +347,6 @@ rm -rf build && meson setup build -Dno_tests=true -Dno_examples=true
 |-----------|------|--------|
 | `ace` | git wrap (OnionSpirit/ace) | Active, used for I/O |
 | `usrsctp` | git wrap | Active, compiled as subproject |
-| `libjuice` | git wrap (custom meson.build) | Active, compiled as subproject |
 | `plog` | git wrap (custom meson.build) | Active, header-only |
 | `nlohmann_json` | git wrap (built-in meson.build) | Header-only, for examples |
 | `libsrtp2` | system pkg (fallback: wrap) | System version used |
@@ -377,9 +375,12 @@ include/rtc/
 src/
   global.cpp                ← MODIFIED (added Run/RunAsync/Stop implementations)
 
-  (pending — ICE migration)
-  impl/icetransport.hpp/cpp
-  impl/iceudpmuxlistener.hpp/cpp
+  impl/icetransport.hpp/cpp    ← REWRITTEN (ace::net ICE/STUN/TURN)
+  impl/iceudpmuxlistener.hpp/cpp ← REWRITTEN (ace::net mux)
+  impl/stuncrypto.hpp          ← CREATED (CRC32/SHA/HMAC wrappers)
+  impl/stunprotocol.hpp        ← CREATED (STUN protocol)
+  impl/turnprotocol.hpp        ← CREATED (TURN protocol)
+  impl/iceprotocol.hpp         ← CREATED (ICE protocol)
 
   (pending — public API migration)
   include/rtc/peerconnection.hpp

@@ -1,5 +1,6 @@
 /**
  * Copyright (c) 2019-2020 Paul-Louis Ageneau
+ * Copyright (c) 2026 Ivan Moskalev (OnionSpirit)
  *
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -9,970 +10,697 @@
 #include "icetransport.hpp"
 #include "configuration.hpp"
 #include "internals.hpp"
-#include "transport.hpp"
 #include "utils.hpp"
 
-#include <algorithm>
-#include <future>
-#include <iostream>
-#include <random>
-#include <sstream>
+#include <ace/net.h>
+#include <ace/futures/timeout.h>
+#include <ace/futures/channel.h>
+#include <ace/core/async.h>
+#include <ace/core/dispatcher.h>
 
-#ifdef _WIN32
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#else
-#include <arpa/inet.h>
+#include <algorithm>
+#include <cstring>
+#include <random>
+
+#ifndef _WIN32
 #include <netdb.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
+#include <unistd.h>
 #endif
 
-#include <sys/types.h>
-
 using namespace std::chrono_literals;
-using std::chrono::system_clock;
+using namespace rtc::impl::ice;
+using namespace rtc::impl::stun;
+using namespace rtc::impl::turn;
 
 namespace rtc::impl {
 
-#if !USE_NICE // libjuice
+// ===================================================================
+// Helpers
+// ===================================================================
 
-const int MAX_TURN_SERVERS_COUNT = 2;
-
-void IceTransport::Init() {
-	// Dummy
+static int64_t now_ms() {
+	return std::chrono::duration_cast<std::chrono::milliseconds>(
+	           std::chrono::system_clock::now().time_since_epoch())
+	    .count();
 }
 
-void IceTransport::Cleanup() {
-	// Dummy
+static int resolve_addr(const std::string &host, uint16_t port, AddrRecord &out) {
+	struct addrinfo hints = {}, *result = nullptr;
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_DGRAM;
+	hints.ai_protocol = IPPROTO_UDP;
+	hints.ai_flags = AI_ADDRCONFIG;
+	std::string ps = std::to_string(port);
+	if (getaddrinfo(host.c_str(), ps.c_str(), &hints, &result) != 0) return -1;
+	for (auto *ai = result; ai; ai = ai->ai_next) {
+		if (ai->ai_family == AF_INET || ai->ai_family == AF_INET6) {
+			memcpy(out.addr.data(), ai->ai_addr, ai->ai_addrlen);
+			out.len = ai->ai_addrlen;
+			out.socktype = ai->ai_socktype;
+			freeaddrinfo(result);
+			return 0;
+		}
+	}
+	freeaddrinfo(result);
+	return -1;
 }
+
+// ===================================================================
+// Init / Cleanup
+// ===================================================================
+
+void IceTransport::Init() {}
+void IceTransport::Cleanup() {}
+
+// ===================================================================
+// Constructor
+// ===================================================================
 
 IceTransport::IceTransport(const Configuration &config, candidate_callback candidateCallback,
                            state_callback stateChangeCallback,
                            gathering_state_callback gatheringStateChangeCallback)
-    : Transport(nullptr, std::move(stateChangeCallback)), mRole(Description::Role::ActPass),
-      mMid("0"), mGatheringState(GatheringState::New),
+    : Transport(nullptr, std::move(stateChangeCallback)),
+      mRole(Description::Role::ActPass),
+      mGatheringState(GatheringState::New),
       mCandidateCallback(std::move(candidateCallback)),
       mGatheringStateChangeCallback(std::move(gatheringStateChangeCallback)),
-      mAgent(nullptr, nullptr) {
+      mConfig(config) {
 
-	PLOG_DEBUG << "Initializing ICE transport (libjuice)";
+	PLOG_DEBUG << "Initializing ICE transport (ace::net)";
 
-	juice_log_level_t level;
-	auto logger = plog::get();
-	switch (logger ? logger->getMaxSeverity() : plog::none) {
-	case plog::none:
-		level = JUICE_LOG_LEVEL_NONE;
-		break;
-	case plog::fatal:
-		level = JUICE_LOG_LEVEL_FATAL;
-		break;
-	case plog::error:
-		level = JUICE_LOG_LEVEL_ERROR;
-		break;
-	case plog::warning:
-		level = JUICE_LOG_LEVEL_WARN;
-		break;
-	case plog::info:
-	case plog::debug: // juice debug is output as verbose
-		level = JUICE_LOG_LEVEL_INFO;
-		break;
-	default:
-		level = JUICE_LOG_LEVEL_VERBOSE;
-		break;
-	}
-	juice_set_log_handler(IceTransport::LogCallback);
-	juice_set_log_level(level);
+	// Create UDP socket
+	int sock = socket(AF_INET, SOCK_DGRAM, 0);
+	if (sock < 0) throw std::runtime_error("Failed to create UDP socket");
 
-	juice_config_t jconfig = {};
-	jconfig.cb_state_changed = IceTransport::StateChangeCallback;
-	jconfig.cb_candidate = IceTransport::CandidateCallback;
-	jconfig.cb_gathering_done = IceTransport::GatheringDoneCallback;
-	jconfig.cb_recv = IceTransport::RecvCallback;
-	jconfig.user_ptr = this;
+	int enable = 1;
+	setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable));
 
-	if (config.enableIceUdpMux) {
-		PLOG_DEBUG << "Enabling ICE UDP mux";
-		jconfig.concurrency_mode = JUICE_CONCURRENCY_MODE_MUX;
-	} else {
-		jconfig.concurrency_mode = JUICE_CONCURRENCY_MODE_POLL;
-	}
+	sockaddr_in bind_addr = {};
+	bind_addr.sin_family = AF_INET;
+	bind_addr.sin_addr.s_addr = INADDR_ANY;
 
-	// Randomize servers order
-	std::vector<IceServer> servers = config.iceServers;
-	std::shuffle(servers.begin(), servers.end(), utils::random_engine());
-
-	// Pick a STUN server
-	for (auto &server : servers) {
-		if (!server.hostname.empty() && server.type == IceServer::Type::Stun) {
-			if (server.port == 0)
-				server.port = 3478; // STUN UDP port
-			PLOG_INFO << "Using STUN server \"" << server.hostname << ":" << server.port << "\"";
-			jconfig.stun_server_host = server.hostname.c_str();
-			jconfig.stun_server_port = server.port;
-			break;
+	if (config.bindAddress) {
+		struct addrinfo *result = nullptr;
+		addrinfo hints = {};
+		hints.ai_family = AF_INET;
+		hints.ai_socktype = SOCK_DGRAM;
+		hints.ai_flags = AI_NUMERICHOST;
+		getaddrinfo(config.bindAddress->c_str(), nullptr, &hints, &result);
+		if (result) {
+			bind_addr.sin_addr = ((sockaddr_in *)result->ai_addr)->sin_addr;
+			freeaddrinfo(result);
 		}
 	}
 
-	// Bind address
-	if (config.bindAddress) {
-		jconfig.bind_address = config.bindAddress->c_str();
+	if (config.portRangeBegin > 1024) {
+		bool bound = false;
+		for (uint16_t p = config.portRangeBegin;
+		     p <= (config.portRangeEnd ? config.portRangeEnd : config.portRangeBegin); ++p) {
+			bind_addr.sin_port = htons(p);
+			if (bind(sock, (sockaddr *)&bind_addr, sizeof(bind_addr)) == 0) {
+				bound = true;
+				break;
+			}
+		}
+		if (!bound) {
+			close(sock);
+			throw std::runtime_error("Failed to bind UDP socket in port range");
+		}
+	} else {
+		bind_addr.sin_port = 0;
+		if (bind(sock, (sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
+			close(sock);
+			throw std::runtime_error("Failed to bind UDP socket");
+		}
 	}
 
-	// Port range
-	if (config.portRangeBegin > 1024 ||
-	    (config.portRangeEnd != 0 && config.portRangeEnd != 65535)) {
-		jconfig.local_port_range_begin = config.portRangeBegin;
-		jconfig.local_port_range_end = config.portRangeEnd;
-	}
+	int dscp = 0;
+	setsockopt(sock, IPPROTO_IP, IP_TOS, &dscp, sizeof(dscp));
 
-	// Create agent
-	mAgent = decltype(mAgent)(juice_create(&jconfig), juice_destroy);
-	if (!mAgent)
-		throw std::runtime_error("Failed to create the ICE agent");
+	mNetIface = std::make_unique<ace::net::net_interface>(sock, false);
+	mSocketFd = sock;
 
-	// ICE-TCP
-	juice_set_ice_tcp_mode(mAgent.get(), config.enableIceTcp ? JUICE_ICE_TCP_MODE_ACTIVE
-	                                                         : JUICE_ICE_TCP_MODE_NONE);
+	sockaddr_in actual_addr = {};
+	socklen_t addrlen = sizeof(actual_addr);
+	getsockname(sock, (sockaddr *)&actual_addr, &addrlen);
+	PLOG_INFO << "ICE transport bound to UDP port " << ntohs(actual_addr.sin_port);
 
-	// Add TURN servers
-	for (const auto &server : servers)
-		if (!server.hostname.empty() && server.type != IceServer::Type::Stun)
-			addIceServer(server);
-}
+	mLocalDescription = create_local_description();
+	mTiebreaker = (uint64_t)now_ms() << 16 | ntohs(actual_addr.sin_port);
 
-void IceTransport::setIceAttributes(string uFrag, string pwd) {
-	if (juice_set_local_ice_attributes(mAgent.get(), uFrag.c_str(), pwd.c_str()) < 0) {
-		throw std::invalid_argument("Invalid ICE attributes");
-	}
-}
-
-void IceTransport::addIceServer(IceServer server) {
-	if (server.hostname.empty())
-		return;
-
-	if (server.type != IceServer::Type::Turn) {
-		PLOG_WARNING << "Only TURN servers are supported as additional ICE servers";
-		return;
-	}
-
-	if (server.relayType != IceServer::RelayType::TurnUdp) {
-		PLOG_WARNING << "TURN transports TCP and TLS are not supported with libjuice";
-		return;
-	}
-
-	if (mTurnServersAdded >= MAX_TURN_SERVERS_COUNT)
-		return;
-
-	if (server.port == 0)
-		server.port = 3478; // TURN UDP port
-
-	PLOG_INFO << "Using TURN server \"" << server.hostname << ":" << server.port << "\"";
-	juice_turn_server_t turn_server = {};
-	turn_server.host = server.hostname.c_str();
-	turn_server.username = server.username.c_str();
-	turn_server.password = server.password.c_str();
-	turn_server.port = server.port;
-
-	if (juice_add_turn_server(mAgent.get(), &turn_server) != 0)
-		throw std::runtime_error("Failed to add TURN server");
-
-	++mTurnServersAdded;
+	ace::schedule(ioLoop());
 }
 
 IceTransport::~IceTransport() {
 	PLOG_DEBUG << "Destroying ICE transport";
-	mAgent.reset();
+	mRunning.store(false);
+	if (mNetIface) mNetIface.reset();
 }
+
+// ===================================================================
+// Public API
+// ===================================================================
 
 Description::Role IceTransport::role() const { return mRole; }
 
-Description IceTransport::getLocalDescription(Description::Type type) const {
-	char sdp[JUICE_MAX_SDP_STRING_LEN];
-	if (juice_get_local_description(mAgent.get(), sdp, JUICE_MAX_SDP_STRING_LEN) < 0)
-		throw std::runtime_error("Failed to generate local SDP");
+auto IceTransport::gatheringState() const -> GatheringState { return mGatheringState.load(); }
 
-	// RFC 5763: The endpoint that is the offerer MUST use the setup attribute value of
-	// setup:actpass.
-	// See https://www.rfc-editor.org/rfc/rfc5763.html#section-5
-	Description desc(string(sdp), type,
+void IceTransport::setIceAttributes(string uFrag, string pwd) {
+	if (!::rtc::impl::ice::ice_is_valid_string(uFrag) || !::rtc::impl::ice::ice_is_valid_string(pwd))
+		throw std::invalid_argument("Invalid ICE attributes");
+	mLocalDescription.ice_ufrag = std::move(uFrag);
+	mLocalDescription.ice_pwd = std::move(pwd);
+}
+
+Description IceTransport::getLocalDescription(Description::Type type) const {
+	std::string sdp = generate_sdp(mLocalDescription);
+	Description desc(sdp, type,
 	                 type == Description::Type::Offer ? Description::Role::ActPass : mRole);
 	desc.addIceOption("trickle");
 	return desc;
 }
 
 void IceTransport::setRemoteDescription(const Description &description) {
-	// RFC 5763: The answerer MUST use either a setup attribute value of setup:active or
-	// setup:passive.
-	// See https://www.rfc-editor.org/rfc/rfc5763.html#section-5
 	if (description.type() == Description::Type::Answer &&
 	    description.role() == Description::Role::ActPass)
 		throw std::invalid_argument("Illegal role actpass in remote answer description");
 
-	// RFC 5763: Note that if the answerer uses setup:passive, then the DTLS handshake
-	// will not begin until the answerer is received, which adds additional latency.
-	// setup:active allows the answer and the DTLS handshake to occur in parallel. Thus,
-	// setup:active is RECOMMENDED.
 	if (mRole == Description::Role::ActPass)
-		mRole = description.role() == Description::Role::Active ? Description::Role::Passive
-		                                                        : Description::Role::Active;
+		mRole = description.role() == Description::Role::Active
+		            ? Description::Role::Passive
+		            : Description::Role::Active;
 
 	if (mRole == description.role())
 		throw std::invalid_argument("Incompatible roles with remote description");
 
 	mMid = description.bundleMid();
-	if (juice_set_remote_description(mAgent.get(),
-	                                 description.generateApplicationSdp("\r\n").c_str()) < 0)
-		throw std::invalid_argument("Invalid ICE settings from remote SDP");
+	mIsControlling = (mRole == Description::Role::Active);
+
+	parse_sdp(description.generateApplicationSdp("\r\n"), mRemoteDescription);
+	mRemoteCandidates.clear();
+	for (auto &c : mRemoteDescription.candidates)
+		mRemoteCandidates.push_back(c);
+
+	PLOG_INFO << "Remote description: ufrag=" << mRemoteDescription.ice_ufrag
+	          << " candidates=" << mRemoteCandidates.size();
+
+	scheduleChecks();
 }
 
 bool IceTransport::addRemoteCandidate(const Candidate &candidate) {
-	// Don't try to pass unresolved candidates for more safety
-	if (!candidate.isResolved())
-		return false;
-
-	return juice_add_remote_candidate(mAgent.get(), string(candidate).c_str()) >= 0;
+	if (!candidate.isResolved()) return false;
+	std::string sdp = static_cast<string>(candidate);
+	IceCandidate c;
+	if (parse_candidate_sdp(sdp, c) != 0) return false;
+	mRemoteCandidates.push_back(c);
+	scheduleChecks();
+	return true;
 }
 
 void IceTransport::gatherLocalCandidates(string mid, std::vector<IceServer> additionalIceServers) {
 	mMid = std::move(mid);
-
-	std::shuffle(additionalIceServers.begin(), additionalIceServers.end(), utils::random_engine());
-	for (const auto &server : additionalIceServers)
-		addIceServer(server);
-
-	// Change state now as candidates calls can be synchronous
 	changeGatheringState(GatheringState::InProgress);
 
-	if (juice_gather_candidates(mAgent.get()) < 0) {
-		throw std::runtime_error("Failed to gather local ICE candidates");
+	gatherHostCandidates();
+
+	auto servers = mConfig.iceServers;
+	for (auto &s : additionalIceServers) servers.push_back(s);
+
+	for (auto &server : servers) {
+		if (server.type == IceServer::Type::Stun && !server.hostname.empty()) {
+			uint16_t port = server.port ? server.port : 3478;
+			gatherSrflxCandidates(server.hostname, port);
+			break;
+		}
 	}
+
+	for (auto &server : servers) {
+		if (server.type == IceServer::Type::Turn && !server.hostname.empty()) {
+			addIceServer(server);
+		}
+	}
+
+	PLOG_INFO << "Local candidates: " << mLocalCandidates.size();
+	if (mGatheringState.load() == GatheringState::InProgress)
+		changeGatheringState(GatheringState::Complete);
 }
 
 optional<string> IceTransport::getLocalAddress() const {
-	char str[JUICE_MAX_ADDRESS_STRING_LEN];
-	if (juice_get_selected_addresses(mAgent.get(), str, JUICE_MAX_ADDRESS_STRING_LEN, NULL, 0) ==
-	    0) {
-		return std::make_optional(string(str));
-	}
+	if (mSelectedPair && mSelectedPair->local)
+		return mSelectedPair->local->hostname + ":" + mSelectedPair->local->service;
 	return nullopt;
 }
+
 optional<string> IceTransport::getRemoteAddress() const {
-	char str[JUICE_MAX_ADDRESS_STRING_LEN];
-	if (juice_get_selected_addresses(mAgent.get(), NULL, 0, str, JUICE_MAX_ADDRESS_STRING_LEN) ==
-	    0) {
-		return std::make_optional(string(str));
-	}
+	if (mSelectedPair && mSelectedPair->remote)
+		return mSelectedPair->remote->hostname + ":" + mSelectedPair->remote->service;
 	return nullopt;
 }
 
 bool IceTransport::getSelectedCandidatePair(Candidate *local, Candidate *remote) {
-	char sdpLocal[JUICE_MAX_CANDIDATE_SDP_STRING_LEN];
-	char sdpRemote[JUICE_MAX_CANDIDATE_SDP_STRING_LEN];
-	if (juice_get_selected_candidates(mAgent.get(), sdpLocal, JUICE_MAX_CANDIDATE_SDP_STRING_LEN,
-	                                  sdpRemote, JUICE_MAX_CANDIDATE_SDP_STRING_LEN) == 0) {
-		if (local) {
-			*local = Candidate(sdpLocal, mMid);
-			local->resolve(Candidate::ResolveMode::Simple);
+	if (!mSelectedPair) return false;
+	if (local) {
+		auto sdp = generate_candidate_sdp(*mSelectedPair->local);
+		*local = Candidate(sdp, mMid);
+		local->resolve(Candidate::ResolveMode::Simple);
+	}
+	if (remote) {
+		auto sdp = generate_candidate_sdp(*mSelectedPair->remote);
+		*remote = Candidate(sdp, mMid);
+		remote->resolve(Candidate::ResolveMode::Simple);
+	}
+	return true;
+}
+
+bool IceTransport::send(message_ptr message) {
+	auto s = state();
+	if (!message || (s != State::Connected && s != State::Completed)) return false;
+	PLOG_VERBOSE << "Send size=" << message->size();
+	return outgoing(message);
+}
+
+bool IceTransport::outgoing(message_ptr message) {
+	std::lock_guard<std::mutex> lock(mSendMutex);
+	if (mSelectedPair && mSelectedPair->remote) {
+		return ::sendto(mSocketFd, message->data(), message->size(), 0,
+		                (const sockaddr *)mSelectedPair->remote->resolved.addr.data(),
+		                mSelectedPair->remote->resolved.len) >= 0;
+	}
+	// Try TURN channel
+	for (auto &ts : mTurnServers) {
+		if (!ts.allocated || !ts.data_channel || !ts.resolved_addr.isValid()) continue;
+		uint8_t chbuf[4096];
+		int n = wrap_channel_data(chbuf, sizeof(chbuf),
+		                           (const uint8_t *)message->data(), message->size(),
+		                           ts.data_channel);
+		if (n > 0) {
+			return ::sendto(mSocketFd, chbuf, n, 0,
+			                (const sockaddr *)ts.resolved_addr.addr.data(),
+			                ts.resolved_addr.len) >= 0;
 		}
-		if (remote) {
-			*remote = Candidate(sdpRemote, mMid);
-			remote->resolve(Candidate::ResolveMode::Simple);
-		}
-		return true;
 	}
 	return false;
 }
 
-bool IceTransport::send(message_ptr message) {
-	auto s = state();
-	if (!message || (s != State::Connected && s != State::Completed))
-		return false;
+// ===================================================================
+// Candidate gathering
+// ===================================================================
 
-	PLOG_VERBOSE << "Send size=" << message->size();
-	return outgoing(message);
+void IceTransport::gatherHostCandidates() {
+	AddrRecord rec;
+	rec.len = sizeof(sockaddr_in);
+	rec.socktype = SOCK_DGRAM;
+	auto *sin = (sockaddr_in *)rec.addr.data();
+
+	sockaddr_in bound = {};
+	socklen_t addrlen = sizeof(bound);
+	getsockname(mSocketFd, (sockaddr *)&bound, &addrlen);
+	sin->sin_family = AF_INET;
+	sin->sin_port = bound.sin_port;
+	sin->sin_addr = bound.sin_addr;
+
+	int idx = (int)mLocalCandidates.size();
+	auto cand = create_local_candidate(IceCandidateType::HOST, 1, idx, rec,
+	                                    IceCandidateTransport::UDP);
+	mLocalCandidates.push_back(cand);
+	mLocalDescription.candidates.push_back(cand);
+
+	auto sdp = generate_candidate_sdp(cand);
+	mCandidateCallback(Candidate(sdp, mMid));
 }
 
-bool IceTransport::outgoing(message_ptr message) {
-	// Explicit Congestion Notification takes the least-significant 2 bits of the DS field
-	int ds = int(message->dscp << 2);
-	return juice_send_diffserv(mAgent.get(), reinterpret_cast<const char *>(message->data()),
-	                           message->size(), ds) >= 0;
+void IceTransport::gatherSrflxCandidates(const string &stunHost, uint16_t stunPort) {
+	PLOG_INFO << "STUN binding for srflx: " << stunHost << ":" << stunPort;
+
+	AddrRecord stun_addr;
+	if (resolve_addr(stunHost, stunPort, stun_addr) != 0) {
+		PLOG_WARNING << "Failed to resolve STUN server: " << stunHost;
+		return;
+	}
+
+	StunMessage msg;
+	msg.msg_class = StunClass::REQUEST;
+	msg.msg_method = StunMethod::BINDING;
+	random_bytes(msg.transaction_id.data(), STUN_TRANSACTION_ID_SIZE);
+
+	sendStunMessage(stun_addr, msg);
+
+	IceCheck check;
+	memcpy(check.transaction_id.data(), msg.transaction_id.data(), STUN_TRANSACTION_ID_SIZE);
+	check.is_stun_binding = true;
+	check.next_retransmit = now_ms() + 500;
+	mPendingChecks.push_back(check);
 }
+
+void IceTransport::gatherRelayCandidates(const IceServer &server) {
+	PLOG_INFO << "TURN allocate: " << server.hostname << ":" << server.port;
+
+	uint16_t port = server.port ? server.port : 3478;
+
+	TurnCtx ts;
+	ts.hostname = server.hostname;
+	ts.port = port;
+	ts.username = server.username;
+	ts.password = server.password;
+
+	if (resolve_addr(server.hostname, port, ts.resolved_addr) != 0) {
+		PLOG_WARNING << "Failed to resolve TURN server: " << server.hostname;
+		return;
+	}
+
+	StunMessage msg;
+	msg.msg_class = StunClass::REQUEST;
+	msg.msg_method = StunMethod::ALLOCATE;
+	random_bytes(msg.transaction_id.data(), STUN_TRANSACTION_ID_SIZE);
+	msg.requested_transport = true;
+	msg.lifetime = 600;
+	msg.lifetime_set = true;
+	if (!ts.username.empty()) msg.credentials.username = ts.username;
+
+	sendStunMessage(ts.resolved_addr, msg, ts.password.empty() ? nullptr : ts.password.c_str());
+	mTurnServers.push_back(std::move(ts));
+}
+
+void IceTransport::addIceServer(const IceServer &server) {
+	gatherRelayCandidates(server);
+}
+
+// ===================================================================
+// Scheduling
+// ===================================================================
+
+void IceTransport::scheduleChecks() {
+	if (mLocalCandidates.empty() || mRemoteCandidates.empty()) return;
+	if (mGatheringState.load() == GatheringState::New)
+		changeGatheringState(GatheringState::InProgress);
+
+	mPairs.clear();
+	mPendingChecks.clear();
+
+	for (auto &local : mLocalCandidates) {
+		for (auto &remote : mRemoteCandidates) {
+			if (local.resolved.isValid() && remote.resolved.isValid()) {
+				auto *lsa = (const sockaddr *)local.resolved.addr.data();
+				auto *rsa = (const sockaddr *)remote.resolved.addr.data();
+				if (lsa->sa_family != rsa->sa_family) continue;
+			}
+			auto pair = create_pair(&local, &remote, mIsControlling);
+			pair.state = IcePairState::PENDING;
+			mPairs.push_back(std::move(pair));
+		}
+	}
+
+	std::sort(mPairs.begin(), mPairs.end(),
+	          [](const IceCandidatePair &a, const IceCandidatePair &b) {
+		          return a.priority > b.priority;
+	          });
+
+	for (auto &pair : mPairs) {
+		if (mPendingChecks.size() >= 5) break;
+		IceCheck check;
+		check.pair = &pair;
+		random_bytes(check.transaction_id.data(), STUN_TRANSACTION_ID_SIZE);
+		check.next_retransmit = now_ms();
+		mPendingChecks.push_back(check);
+	}
+
+	PLOG_INFO << "Scheduled checks: " << mPendingChecks.size()
+	          << " for " << mPairs.size() << " pairs";
+}
+
+// ===================================================================
+// STUN / send helpers
+// ===================================================================
+
+bool IceTransport::sendStunMessage(const AddrRecord &dst, const StunMessage &msg,
+                                    const char *password) {
+	uint8_t buf[4096];
+	memset(buf, 0, sizeof(buf));
+	int len = stun_write(buf, sizeof(buf), msg, password);
+	if (len <= 0) return false;
+	return sendRaw(dst, buf, len) > 0;
+}
+
+int IceTransport::sendRaw(const AddrRecord &dst, const void *data, size_t size) {
+	if (!mNetIface) return -1;
+	std::lock_guard<std::mutex> lock(mSendMutex);
+	return (int)::sendto(mSocketFd, data, size, 0,
+	                     (const sockaddr *)dst.addr.data(), dst.len);
+}
+
+// ===================================================================
+// State helpers
+// ===================================================================
 
 void IceTransport::changeGatheringState(GatheringState state) {
-	if (mGatheringState.exchange(state) != state)
-		mGatheringStateChangeCallback(mGatheringState);
-}
-
-void IceTransport::processStateChange(unsigned int state) {
-	switch (state) {
-	case JUICE_STATE_DISCONNECTED:
-		changeState(State::Disconnected);
-		break;
-	case JUICE_STATE_CONNECTING:
-		changeState(State::Connecting);
-		break;
-	case JUICE_STATE_CONNECTED:
-		changeState(State::Connected);
-		break;
-	case JUICE_STATE_COMPLETED:
-		changeState(State::Completed);
-		break;
-	case JUICE_STATE_FAILED:
-		changeState(State::Failed);
-		break;
-	};
+	if (mGatheringState.exchange(state) != state) {
+		try { mGatheringStateChangeCallback(mGatheringState); }
+		catch (const std::exception &e) { PLOG_WARNING << e.what(); }
+	}
 }
 
 void IceTransport::processCandidate(const string &candidate) {
-	mCandidateCallback(Candidate(candidate, mMid));
+	try { mCandidateCallback(Candidate(candidate, mMid)); }
+	catch (const std::exception &e) { PLOG_WARNING << e.what(); }
 }
 
-void IceTransport::processGatheringDone() { changeGatheringState(GatheringState::Complete); }
-
-void IceTransport::StateChangeCallback(juice_agent_t *, juice_state_t state, void *user_ptr) {
-	auto iceTransport = static_cast<rtc::impl::IceTransport *>(user_ptr);
-	try {
-		iceTransport->processStateChange(static_cast<unsigned int>(state));
-	} catch (const std::exception &e) {
-		PLOG_WARNING << e.what();
-	}
+void IceTransport::processGatheringDone() {
+	changeGatheringState(GatheringState::Complete);
 }
 
-void IceTransport::CandidateCallback(juice_agent_t *, const char *sdp, void *user_ptr) {
-	auto iceTransport = static_cast<rtc::impl::IceTransport *>(user_ptr);
-	try {
-		iceTransport->processCandidate(sdp);
-	} catch (const std::exception &e) {
-		PLOG_WARNING << e.what();
-	}
-}
+// ===================================================================
+// ACE I/O loop
+// ===================================================================
 
-void IceTransport::GatheringDoneCallback(juice_agent_t *, void *user_ptr) {
-	auto iceTransport = static_cast<rtc::impl::IceTransport *>(user_ptr);
-	try {
-		iceTransport->processGatheringDone();
-	} catch (const std::exception &e) {
-		PLOG_WARNING << e.what();
-	}
-}
+ace::task IceTransport::ioLoop() {
+	uint8_t buffer[4096];
 
-void IceTransport::RecvCallback(juice_agent_t *, const char *data, size_t size, void *user_ptr) {
-	auto iceTransport = static_cast<rtc::impl::IceTransport *>(user_ptr);
-	try {
-		PLOG_VERBOSE << "Incoming size=" << size;
-		auto b = reinterpret_cast<const byte *>(data);
-		iceTransport->incoming(make_message(b, b + size));
-	} catch (const std::exception &e) {
-		PLOG_WARNING << e.what();
-	}
-}
+	while (mRunning.load()) {
+		int64_t now = now_ms();
 
-void IceTransport::LogCallback(juice_log_level_t level, const char *message) {
-	plog::Severity severity;
-	switch (level) {
-	case JUICE_LOG_LEVEL_FATAL:
-		severity = plog::fatal;
-		break;
-	case JUICE_LOG_LEVEL_ERROR:
-		severity = plog::error;
-		break;
-	case JUICE_LOG_LEVEL_WARN:
-		severity = plog::warning;
-		break;
-	case JUICE_LOG_LEVEL_INFO:
-		severity = plog::info;
-		break;
-	default:
-		severity = plog::verbose; // libjuice debug as verbose
-		break;
-	}
-	PLOG(severity) << "juice: " << message;
-}
+		// Process pending STUN checks
+		for (auto &check : mPendingChecks) {
+			if (now < check.next_retransmit) continue;
+			if (check.retransmits > 7) {
+				if (check.pair) check.pair->state = IcePairState::FAILED;
+				check.next_retransmit = INT64_MAX;
+				continue;
+			}
 
-#else // USE_NICE == 1
+			StunMessage msg;
+			msg.msg_class = StunClass::REQUEST;
+			msg.msg_method = StunMethod::BINDING;
+			memcpy(msg.transaction_id.data(), check.transaction_id.data(), STUN_TRANSACTION_ID_SIZE);
 
-IceTransport::MainLoopWrapper *IceTransport::MainLoop = nullptr;
+			if (check.is_stun_binding) {
+				if (!mTurnServers.empty() && mTurnServers[0].resolved_addr.isValid()) {
+					sendStunMessage(mTurnServers[0].resolved_addr, msg);
+				}
+			} else if (check.pair && check.pair->local && check.pair->remote) {
+				auto &local = *check.pair->local;
+				auto &remote = *check.pair->remote;
 
-IceTransport::MainLoopWrapper::MainLoopWrapper()
-    : mMainLoop(g_main_loop_new(nullptr, FALSE), g_main_loop_unref) {
-	if (!mMainLoop)
-		throw std::runtime_error("Failed to create the glib main loop");
+				msg.credentials.username =
+				    mRemoteDescription.ice_ufrag + ":" + mLocalDescription.ice_ufrag;
+				msg.priority = compute_priority(IceCandidateType::PEER_REFLEXIVE, AF_INET,
+				                                local.component, 0,
+				                                IceCandidateTransport::UDP);
 
-	mThread = std::thread(g_main_loop_run, mMainLoop.get());
-}
+				if (mIsControlling) {
+					msg.ice_controlling = mTiebreaker;
+					if (check.pair->nomination_requested) msg.use_candidate = true;
+				} else {
+					msg.ice_controlled = mTiebreaker;
+				}
 
-IceTransport::MainLoopWrapper::~MainLoopWrapper() {
-	g_main_loop_quit(mMainLoop.get());
-	mThread.join();
-}
+				sendStunMessage(remote.resolved, msg, mRemoteDescription.ice_pwd.c_str());
+			}
 
-GMainLoop *IceTransport::MainLoopWrapper::get() const { return mMainLoop.get(); }
-
-void IceTransport::Init() {
-	g_log_set_handler("libnice", G_LOG_LEVEL_MASK, LogCallback, nullptr);
-
-	IF_PLOG(plog::verbose) {
-		nice_debug_enable(false); // do not output STUN debug messages
-	}
-
-	MainLoop = new MainLoopWrapper;
-}
-
-void IceTransport::Cleanup() {
-	delete MainLoop;
-	MainLoop = nullptr;
-}
-
-static void closeNiceAgentCallback(GObject *niceAgent, GAsyncResult *, gpointer) {
-	g_object_unref(niceAgent);
-}
-
-static void closeNiceAgent(NiceAgent *niceAgent) {
-	// close the agent to prune alive TURN refreshes, before releasing it
-	nice_agent_close_async(niceAgent, closeNiceAgentCallback, nullptr);
-}
-
-IceTransport::IceTransport(const Configuration &config, candidate_callback candidateCallback,
-                           state_callback stateChangeCallback,
-                           gathering_state_callback gatheringStateChangeCallback)
-    : Transport(nullptr, std::move(stateChangeCallback)), mRole(Description::Role::ActPass),
-      mMid("0"), mGatheringState(GatheringState::New),
-      mCandidateCallback(std::move(candidateCallback)),
-      mGatheringStateChangeCallback(std::move(gatheringStateChangeCallback)),
-      mNiceAgent(nullptr, nullptr), mOutgoingDscp(0) {
-
-	PLOG_DEBUG << "Initializing ICE transport (libnice)";
-
-	if (!MainLoop)
-		throw std::logic_error("Main loop for nice agent is not created");
-
-	// RFC 8445: The nomination process that was referred to as "aggressive nomination" in RFC 5245
-	// has been deprecated in this specification.
-	// libnice defaults to aggressive nomation therefore we change to regular nomination.
-	// See https://gitlab.freedesktop.org/libnice/libnice/-/merge_requests/125
-	// Enable RFC 7675 ICE consent freshness support (requires libnice 0.1.19)
-	NiceAgentOption flags = static_cast<NiceAgentOption>(NICE_AGENT_OPTION_REGULAR_NOMINATION | NICE_AGENT_OPTION_CONSENT_FRESHNESS);
-
-	// Create agent
-	mNiceAgent = decltype(mNiceAgent)(
-	    nice_agent_new_full(
-	        g_main_loop_get_context(MainLoop->get()),
-	        NICE_COMPATIBILITY_RFC5245, // RFC 5245 was obsoleted by RFC 8445 but this should be OK
-	        flags),
-	    closeNiceAgent);
-
-	if (!mNiceAgent)
-		throw std::runtime_error("Failed to create the nice agent");
-
-	mStreamId = nice_agent_add_stream(mNiceAgent.get(), 1);
-	if (!mStreamId)
-		throw std::runtime_error("Failed to add a stream");
-
-	g_object_set(G_OBJECT(mNiceAgent.get()), "controlling-mode", TRUE, nullptr); // decided later
-	g_object_set(G_OBJECT(mNiceAgent.get()), "ice-udp", TRUE, nullptr);
-	g_object_set(G_OBJECT(mNiceAgent.get()), "ice-tcp", config.enableIceTcp ? TRUE : FALSE,
-	             nullptr);
-
-	// RFC 8445: Agents MUST NOT use an RTO value smaller than 500 ms.
-	g_object_set(G_OBJECT(mNiceAgent.get()), "stun-initial-timeout", 500, nullptr);
-	g_object_set(G_OBJECT(mNiceAgent.get()), "stun-max-retransmissions", 3, nullptr);
-
-	// RFC 8445: ICE agents SHOULD use a default Ta value, 50 ms, but MAY use another value based on
-	// the characteristics of the associated data.
-	g_object_set(G_OBJECT(mNiceAgent.get()), "stun-pacing-timer", 25, nullptr);
-
-	g_object_set(G_OBJECT(mNiceAgent.get()), "keepalive-conncheck", TRUE, nullptr);
-	g_object_set(G_OBJECT(mNiceAgent.get()), "upnp", FALSE, nullptr);
-	g_object_set(G_OBJECT(mNiceAgent.get()), "upnp-timeout", 200, nullptr);
-
-	// Proxy
-	if (config.proxyServer) {
-		const auto &proxyServer = *config.proxyServer;
-
-		NiceProxyType type;
-		switch (proxyServer.type) {
-		case ProxyServer::Type::Http:
-			type = NICE_PROXY_TYPE_HTTP;
-			break;
-		case ProxyServer::Type::Socks5:
-			type = NICE_PROXY_TYPE_SOCKS5;
-			break;
-		default:
-			PLOG_WARNING << "Proxy server type is not supported";
-			type = NICE_PROXY_TYPE_NONE;
-			break;
+			check.retransmits++;
+			check.next_retransmit = now_ms() + (500 * (1 << std::min(check.retransmits, 6)));
 		}
 
-		g_object_set(G_OBJECT(mNiceAgent.get()), "proxy-type", type, nullptr);
-		g_object_set(G_OBJECT(mNiceAgent.get()), "proxy-ip", proxyServer.hostname.c_str(), nullptr);
-		g_object_set(G_OBJECT(mNiceAgent.get()), "proxy-port", guint(proxyServer.port), nullptr);
+		mPendingChecks.erase(std::remove_if(mPendingChecks.begin(), mPendingChecks.end(),
+		                                     [](const IceCheck &c) {
+			                                     return c.next_retransmit == INT64_MAX;
+		                                     }),
+		                      mPendingChecks.end());
 
-		if (proxyServer.username)
-			g_object_set(G_OBJECT(mNiceAgent.get()), "proxy-username",
-			             proxyServer.username->c_str(), nullptr);
-
-		if (proxyServer.password)
-			g_object_set(G_OBJECT(mNiceAgent.get()), "proxy-password",
-			             proxyServer.password->c_str(), nullptr);
-	}
-
-	if (config.enableIceUdpMux) {
-		PLOG_WARNING << "ICE UDP mux is not available with libnice";
-	}
-
-	// Randomize order
-	std::vector<IceServer> servers = config.iceServers;
-	std::shuffle(servers.begin(), servers.end(), utils::random_engine());
-
-	// Add one STUN server
-	bool success = false;
-	for (auto &server : servers) {
-		if (server.hostname.empty())
-			continue;
-		if (server.type != IceServer::Type::Stun)
-			continue;
-		if (server.port == 0)
-			server.port = 3478; // STUN UDP port
-
-		struct addrinfo hints = {};
-		hints.ai_family = AF_INET; // IPv4
-		hints.ai_socktype = SOCK_DGRAM;
-		hints.ai_protocol = IPPROTO_UDP;
-		hints.ai_flags = AI_ADDRCONFIG;
-		struct addrinfo *result = nullptr;
-		if (getaddrinfo(server.hostname.c_str(), std::to_string(server.port).c_str(), &hints,
-		                &result) != 0) {
-			PLOG_WARNING << "Unable to resolve STUN server address: " << server.hostname << ':'
-			             << server.port;
-			continue;
+		// TURN refreshes
+		for (auto &ts : mTurnServers) {
+			if (!ts.allocated || !ts.resolved_addr.isValid()) continue;
+			if (now_ms() > ts.allocation_expiry - 60000) {
+				StunMessage refresh;
+				refresh.msg_class = StunClass::REQUEST;
+				refresh.msg_method = StunMethod::REFRESH;
+				random_bytes(refresh.transaction_id.data(), STUN_TRANSACTION_ID_SIZE);
+				refresh.lifetime = 600;
+				refresh.lifetime_set = true;
+				if (!ts.username.empty()) refresh.credentials.username = ts.username;
+				sendStunMessage(ts.resolved_addr, refresh,
+				                ts.password.empty() ? nullptr : ts.password.c_str());
+				ts.allocation_expiry = now_ms() + 600000;
+			}
 		}
 
-		for (auto p = result; p; p = p->ai_next) {
-			if (p->ai_family == AF_INET) {
-				char nodebuffer[MAX_NUMERICNODE_LEN];
-				char servbuffer[MAX_NUMERICSERV_LEN];
-				if (getnameinfo(p->ai_addr, p->ai_addrlen, nodebuffer, MAX_NUMERICNODE_LEN,
-				                servbuffer, MAX_NUMERICSERV_LEN,
-				                NI_NUMERICHOST | NI_NUMERICSERV) == 0) {
-					PLOG_INFO << "Using STUN server \"" << server.hostname << ":" << server.port
-					          << "\"";
-					g_object_set(G_OBJECT(mNiceAgent.get()), "stun-server", nodebuffer, nullptr);
-					g_object_set(G_OBJECT(mNiceAgent.get()), "stun-server-port",
-					             std::stoul(servbuffer), nullptr);
-					success = true;
+		// Receive
+		sockaddr_storage src_addr_storage;
+		ace::io::buffer recv_buf;
+		recv_buf.set_msg_name(src_addr_storage);
+		auto n = co_await mNetIface->recv(recv_buf);
+		if (not n or not mRunning.load()) continue;
+
+		auto hdr = recv_buf.assemble();
+
+		AddrRecord src;
+		memcpy(src.addr.data(), &src_addr_storage, hdr->msg_namelen);
+		src.len = hdr->msg_namelen;
+		src.socktype = SOCK_DGRAM;
+
+		if (is_stun_datagram(buffer, n)) {
+			StunMessage recv_msg;
+			if (stun_read(buffer, n, recv_msg) < 0) continue;
+
+			if (recv_msg.msg_class == StunClass::RESP_SUCCESS &&
+			    recv_msg.msg_method == StunMethod::BINDING) {
+
+				// STUN server binding response — create srflx
+				if (recv_msg.mapped.isValid()) {
+					for (auto &check : mPendingChecks) {
+						if (!check.is_stun_binding) continue;
+						if (memcmp(check.transaction_id.data(), recv_msg.transaction_id.data(),
+						           STUN_TRANSACTION_ID_SIZE) == 0) {
+							int idx = (int)mLocalCandidates.size();
+							auto cand = create_local_candidate(IceCandidateType::SERVER_REFLEXIVE,
+							                                   1, idx, recv_msg.mapped,
+							                                   IceCandidateTransport::UDP);
+							cand.foundation = "srflx-" + std::to_string(idx);
+							mLocalCandidates.push_back(cand);
+							mLocalDescription.candidates.push_back(cand);
+
+							auto sdp = generate_candidate_sdp(cand);
+							PLOG_INFO << "Discovered srflx candidate: " << sdp;
+							mCandidateCallback(Candidate(sdp, mMid));
+
+							check.next_retransmit = INT64_MAX;
+							scheduleChecks();
+							break;
+						}
+					}
+				}
+
+				// Connectivity check response
+				for (auto &check : mPendingChecks) {
+					if (!check.pair || check.is_stun_binding) continue;
+					if (memcmp(check.transaction_id.data(), recv_msg.transaction_id.data(),
+					           STUN_TRANSACTION_ID_SIZE) == 0) {
+						check.pair->state = IcePairState::SUCCEEDED;
+						check.next_retransmit = INT64_MAX;
+						mSelectedPair = check.pair;
+						if (state() == State::Connecting)
+							changeState(State::Connected);
+						break;
+					}
+				}
+			}
+			else if (recv_msg.msg_class == StunClass::REQUEST &&
+			         recv_msg.msg_method == StunMethod::BINDING &&
+			         recv_msg.has_integrity) {
+				// Incoming connectivity check
+				if (!stun_check_integrity(buffer, n, recv_msg,
+				                           mLocalDescription.ice_pwd.c_str())) continue;
+
+				StunMessage resp;
+				resp.msg_class = StunClass::RESP_SUCCESS;
+				resp.msg_method = StunMethod::BINDING;
+				memcpy(resp.transaction_id.data(), recv_msg.transaction_id.data(),
+				       STUN_TRANSACTION_ID_SIZE);
+				resp.mapped = src;
+				sendStunMessage(src, resp, mLocalDescription.ice_pwd.c_str());
+
+				if (state() == State::Disconnected)
+					changeState(State::Connecting);
+
+				if (recv_msg.use_candidate && state() == State::Connecting)
+					changeState(State::Connected);
+			}
+			else if (recv_msg.msg_method == StunMethod::ALLOCATE ||
+			         recv_msg.msg_method == StunMethod::CREATE_PERMISSION ||
+			         recv_msg.msg_method == StunMethod::CHANNEL_BIND) {
+				// TURN response
+				for (auto &ts : mTurnServers) {
+					if (!ts.resolved_addr.isValid()) continue;
+					if (recv_msg.msg_class == StunClass::RESP_SUCCESS) {
+						if (recv_msg.msg_method == StunMethod::ALLOCATE) {
+							ts.relayed_addr = recv_msg.relayed;
+							ts.allocated = true;
+							ts.allocation_expiry = now_ms() + recv_msg.lifetime * 1000;
+
+							int idx = (int)mLocalCandidates.size();
+							auto cand = create_local_candidate(IceCandidateType::RELAYED,
+							                                   1, idx, recv_msg.relayed,
+							                                   IceCandidateTransport::UDP);
+							cand.foundation = "relay-" + std::to_string(idx);
+							mLocalCandidates.push_back(cand);
+							mLocalDescription.candidates.push_back(cand);
+
+							auto sdp = generate_candidate_sdp(cand);
+							PLOG_INFO << "Discovered relay candidate: " << sdp;
+							mCandidateCallback(Candidate(sdp, mMid));
+							scheduleChecks();
+
+							if (!mRemoteCandidates.empty()) {
+								StunMessage perm;
+								perm.msg_class = StunClass::REQUEST;
+								perm.msg_method = StunMethod::CREATE_PERMISSION;
+								random_bytes(perm.transaction_id.data(), STUN_TRANSACTION_ID_SIZE);
+								perm.peers.push_back(mRemoteCandidates.front().resolved);
+								if (!ts.username.empty())
+									perm.credentials.username = ts.username;
+								sendStunMessage(ts.resolved_addr, perm,
+								                ts.password.empty() ? nullptr : ts.password.c_str());
+							}
+						}
+					}
 					break;
 				}
 			}
 		}
-
-		freeaddrinfo(result);
-		if (success)
-			break;
-	}
-
-	// Add TURN servers
-	for (const auto &server : servers)
-		if (!server.hostname.empty() && server.type != IceServer::Type::Stun)
-			addIceServer(server);
-
-	g_signal_connect(G_OBJECT(mNiceAgent.get()), "component-state-changed",
-	                 G_CALLBACK(StateChangeCallback), this);
-	g_signal_connect(G_OBJECT(mNiceAgent.get()), "new-candidate-full",
-	                 G_CALLBACK(CandidateCallback), this);
-	g_signal_connect(G_OBJECT(mNiceAgent.get()), "candidate-gathering-done",
-	                 G_CALLBACK(GatheringDoneCallback), this);
-
-	nice_agent_set_stream_name(mNiceAgent.get(), mStreamId, "application");
-	nice_agent_set_port_range(mNiceAgent.get(), mStreamId, 1, config.portRangeBegin,
-	                          config.portRangeEnd);
-
-	nice_agent_attach_recv(mNiceAgent.get(), mStreamId, 1, g_main_loop_get_context(MainLoop->get()),
-	                       RecvCallback, this);
-}
-
-void IceTransport::setIceAttributes([[maybe_unused]] string uFrag, [[maybe_unused]] string pwd) {
-	PLOG_WARNING
-	    << "Setting custom ICE attributes is not supported with libnice, please use libjuice";
-}
-
-void IceTransport::addIceServer(IceServer server) {
-	if (server.hostname.empty())
-		return;
-
-	if (server.type != IceServer::Type::Turn) {
-		PLOG_WARNING << "Only TURN servers are supported as additional ICE servers";
-		return;
-	}
-
-	if (server.port == 0)
-		server.port = server.relayType == IceServer::RelayType::TurnTls ? 5349 : 3478;
-
-	struct addrinfo hints = {};
-	hints.ai_family = AF_UNSPEC;
-	hints.ai_socktype =
-	    server.relayType == IceServer::RelayType::TurnUdp ? SOCK_DGRAM : SOCK_STREAM;
-	hints.ai_protocol =
-	    server.relayType == IceServer::RelayType::TurnUdp ? IPPROTO_UDP : IPPROTO_TCP;
-	hints.ai_flags = AI_ADDRCONFIG;
-	struct addrinfo *result = nullptr;
-	if (getaddrinfo(server.hostname.c_str(), std::to_string(server.port).c_str(), &hints,
-	                &result) != 0) {
-		PLOG_WARNING << "Unable to resolve TURN server address: " << server.hostname << ':'
-		             << server.port;
-		return;
-	}
-
-	for (auto p = result; p; p = p->ai_next) {
-		if (p->ai_family == AF_INET || p->ai_family == AF_INET6) {
-			char nodebuffer[MAX_NUMERICNODE_LEN];
-			char servbuffer[MAX_NUMERICSERV_LEN];
-			if (getnameinfo(p->ai_addr, p->ai_addrlen, nodebuffer, MAX_NUMERICNODE_LEN, servbuffer,
-			                MAX_NUMERICSERV_LEN, NI_NUMERICHOST | NI_NUMERICSERV) == 0) {
-				PLOG_INFO << "Using TURN server \"" << server.hostname << ":" << server.port
-				          << "\"";
-				NiceRelayType niceRelayType;
-				switch (server.relayType) {
-				case IceServer::RelayType::TurnTcp:
-					niceRelayType = NICE_RELAY_TYPE_TURN_TCP;
-					break;
-				case IceServer::RelayType::TurnTls:
-					niceRelayType = NICE_RELAY_TYPE_TURN_TLS;
-					break;
-				default:
-					niceRelayType = NICE_RELAY_TYPE_TURN_UDP;
-					break;
-				}
-				nice_agent_set_relay_info(mNiceAgent.get(), mStreamId, 1, nodebuffer,
-				                          std::stoul(servbuffer), server.username.c_str(),
-				                          server.password.c_str(), niceRelayType);
+		else if (is_channel_data(buffer, n)) {
+			auto *ch = (const ChannelDataHeader *)buffer;
+			uint16_t data_len = ::ntohs(ch->length);
+			const auto *app_data = buffer + CHANNEL_DATA_HEADER_SIZE;
+			if (data_len <= (size_t)n - CHANNEL_DATA_HEADER_SIZE) {
+				PLOG_VERBOSE << "Incoming channel data size=" << data_len;
+				incoming(make_message((const byte *)app_data, (const byte *)app_data + data_len));
 			}
+		}
+		else {
+			PLOG_VERBOSE << "Incoming app data size=" << n;
+			incoming(make_message((const byte *)buffer, (const byte *)buffer + n));
+			if (state() == State::Disconnected) changeState(State::Connecting);
+		}
+
+		// State transitions
+		bool any_succeeded = false;
+		for (auto &p : mPairs)
+			if (p.state == IcePairState::SUCCEEDED) { any_succeeded = true; break; }
+
+		if (any_succeeded && state() != State::Connected && state() != State::Completed)
+			changeState(State::Connected);
+
+		if (mIsControlling && mSelectedPair && !mSelectedPair->nomination_requested &&
+		    state() == State::Connected) {
+			mSelectedPair->nomination_requested = true;
+			IceCheck nc;
+			nc.pair = mSelectedPair;
+			random_bytes(nc.transaction_id.data(), STUN_TRANSACTION_ID_SIZE);
+			nc.next_retransmit = now_ms();
+			mPendingChecks.push_back(nc);
 		}
 	}
 
-	freeaddrinfo(result);
+	co_return;
 }
-
-IceTransport::~IceTransport() {
-	PLOG_DEBUG << "Destroying ICE transport";
-
-	g_signal_handlers_disconnect_by_func(G_OBJECT(mNiceAgent.get()),
-	                 (gpointer)StateChangeCallback, this);
-	g_signal_handlers_disconnect_by_func(G_OBJECT(mNiceAgent.get()),
-	                 (gpointer)CandidateCallback, this);
-	g_signal_handlers_disconnect_by_func(G_OBJECT(mNiceAgent.get()),
-	                 (gpointer)GatheringDoneCallback, this);
-
-	nice_agent_attach_recv(mNiceAgent.get(), mStreamId, 1, g_main_loop_get_context(MainLoop->get()),
-	                       NULL, NULL);
-
-	// Synchronize with the libnice main loop thread BEFORE freeing the
-	// stream's rx buffer (nice_agent_remove_stream below) or `this`. The
-	// detach above prevents new dispatches, but a callback (e.g.
-	// RecvCallback) may already be running on the main loop thread with
-	// `this` as userData and `buf` pointing into libnice's stream rx buffer.
-	// Post a barrier task to the main context and wait for it to run; GLib
-	// dispatches sources serially on that thread, so once our task runs no
-	// callback can still be using `this` or the rx buffer.
-	{
-		std::promise<void> barrier;
-		auto future = barrier.get_future();
-		g_main_context_invoke_full(
-		    g_main_loop_get_context(MainLoop->get()), G_PRIORITY_HIGH,
-		    [](gpointer data) -> gboolean {
-			    static_cast<std::promise<void> *>(data)->set_value();
-			    return G_SOURCE_REMOVE;
-		    },
-		    &barrier, NULL);
-		future.wait();
-	}
-
-	nice_agent_remove_stream(mNiceAgent.get(), mStreamId);
-	mNiceAgent.reset();
-
-	if (mTimeoutId)
-		g_source_remove(mTimeoutId);
-}
-
-Description::Role IceTransport::role() const { return mRole; }
-
-Description IceTransport::getLocalDescription(Description::Type type) const {
-	// RFC 8445: The initiating agent that started the ICE processing MUST take the controlling
-	// role, and the other MUST take the controlled role.
-	g_object_set(G_OBJECT(mNiceAgent.get()), "controlling-mode",
-	             type == Description::Type::Offer ? TRUE : FALSE, nullptr);
-
-	unique_ptr<gchar[], void (*)(void *)> sdp(nice_agent_generate_local_sdp(mNiceAgent.get()),
-	                                          g_free);
-
-	// RFC 5763: The endpoint that is the offerer MUST use the setup attribute value of
-	// setup:actpass.
-	// See https://www.rfc-editor.org/rfc/rfc5763.html#section-5
-	Description desc(string(sdp.get()), type,
-	                 type == Description::Type::Offer ? Description::Role::ActPass : mRole);
-	desc.addIceOption("trickle");
-	return desc;
-}
-
-void IceTransport::setRemoteDescription(const Description &description) {
-	// RFC 5763: The answerer MUST use either a setup attribute value of setup:active or
-	// setup:passive.
-	// See https://www.rfc-editor.org/rfc/rfc5763.html#section-5
-	if (description.type() == Description::Type::Answer &&
-	    description.role() == Description::Role::ActPass)
-		throw std::invalid_argument("Illegal role actpass in remote answer description");
-
-	// RFC 5763: Note that if the answerer uses setup:passive, then the DTLS handshake
-	// will not begin until the answerer is received, which adds additional latency.
-	// setup:active allows the answer and the DTLS handshake to occur in parallel. Thus,
-	// setup:active is RECOMMENDED.
-	if (mRole == Description::Role::ActPass)
-		mRole = description.role() == Description::Role::Active ? Description::Role::Passive
-		                                                        : Description::Role::Active;
-
-	if (mRole == description.role())
-		throw std::invalid_argument("Incompatible roles with remote description");
-
-	mMid = description.bundleMid();
-	mTrickleTimeout = !description.ended() ? 30s : 0s;
-
-	// Warning: libnice expects "\n" as end of line
-	if (nice_agent_parse_remote_sdp(mNiceAgent.get(),
-	                                description.generateApplicationSdp("\n").c_str()) < 0)
-		throw std::invalid_argument("Invalid ICE settings from remote SDP");
-}
-
-bool IceTransport::addRemoteCandidate(const Candidate &candidate) {
-	// Don't try to pass unresolved candidates to libnice for more safety
-	if (!candidate.isResolved())
-		return false;
-
-	// Warning: the candidate string must start with "a=candidate:" and it must not end with a
-	// newline or whitespace, else libnice will reject it.
-	string sdp(candidate);
-	NiceCandidate *cand =
-	    nice_agent_parse_remote_candidate_sdp(mNiceAgent.get(), mStreamId, sdp.c_str());
-	if (!cand) {
-		PLOG_WARNING << "Rejected ICE candidate: " << sdp;
-		return false;
-	}
-
-	GSList *list = g_slist_append(nullptr, cand);
-	int ret = nice_agent_set_remote_candidates(mNiceAgent.get(), mStreamId, 1, list);
-
-	g_slist_free_full(list, reinterpret_cast<GDestroyNotify>(nice_candidate_free));
-	return ret > 0;
-}
-
-void IceTransport::gatherLocalCandidates(string mid, std::vector<IceServer> additionalIceServers) {
-	mMid = std::move(mid);
-
-	std::shuffle(additionalIceServers.begin(), additionalIceServers.end(), utils::random_engine());
-	for (const auto &server : additionalIceServers)
-		addIceServer(server);
-
-	// Change state now as candidates calls can be synchronous
-	changeGatheringState(GatheringState::InProgress);
-
-	if (!nice_agent_gather_candidates(mNiceAgent.get(), mStreamId)) {
-		throw std::runtime_error("Failed to gather local ICE candidates");
-	}
-}
-
-optional<string> IceTransport::getLocalAddress() const {
-	NiceCandidate *local = nullptr;
-	NiceCandidate *remote = nullptr;
-	if (nice_agent_get_selected_pair(mNiceAgent.get(), mStreamId, 1, &local, &remote)) {
-		return std::make_optional(AddressToString(local->addr));
-	}
-	return nullopt;
-}
-
-optional<string> IceTransport::getRemoteAddress() const {
-	NiceCandidate *local = nullptr;
-	NiceCandidate *remote = nullptr;
-	if (nice_agent_get_selected_pair(mNiceAgent.get(), mStreamId, 1, &local, &remote)) {
-		return std::make_optional(AddressToString(remote->addr));
-	}
-	return nullopt;
-}
-
-bool IceTransport::send(message_ptr message) {
-	auto s = state();
-	if (!message || (s != State::Connected && s != State::Completed))
-		return false;
-
-	PLOG_VERBOSE << "Send size=" << message->size();
-	return outgoing(message);
-}
-
-bool IceTransport::outgoing(message_ptr message) {
-	std::lock_guard lock(mOutgoingMutex);
-	if (mOutgoingDscp != message->dscp) {
-		mOutgoingDscp = message->dscp;
-		// Explicit Congestion Notification takes the least-significant 2 bits of the DS field
-		int ds = int(message->dscp << 2);
-		nice_agent_set_stream_tos(mNiceAgent.get(), mStreamId, ds); // ToS is the legacy name for DS
-	}
-	return nice_agent_send(mNiceAgent.get(), mStreamId, 1, message->size(),
-	                       reinterpret_cast<const char *>(message->data())) >= 0;
-}
-
-void IceTransport::changeGatheringState(GatheringState state) {
-	if (mGatheringState.exchange(state) != state)
-		mGatheringStateChangeCallback(mGatheringState);
-}
-
-void IceTransport::processTimeout() {
-	PLOG_WARNING << "ICE timeout";
-	mTimeoutId = 0;
-	changeState(State::Failed);
-}
-
-void IceTransport::processCandidate(const string &candidate) {
-	mCandidateCallback(Candidate(candidate, mMid));
-}
-
-void IceTransport::processGatheringDone() { changeGatheringState(GatheringState::Complete); }
-
-void IceTransport::processStateChange(unsigned int state) {
-	if (state == NICE_COMPONENT_STATE_FAILED && mTrickleTimeout.count() > 0) {
-		if (mTimeoutId)
-			g_source_remove(mTimeoutId);
-		mTimeoutId = g_timeout_add(mTrickleTimeout.count() /* ms */, TimeoutCallback, this);
-		return;
-	}
-
-	if (state == NICE_COMPONENT_STATE_CONNECTED && mTimeoutId) {
-		g_source_remove(mTimeoutId);
-		mTimeoutId = 0;
-	}
-
-	switch (state) {
-	case NICE_COMPONENT_STATE_DISCONNECTED:
-		changeState(State::Disconnected);
-		break;
-	case NICE_COMPONENT_STATE_CONNECTING:
-		changeState(State::Connecting);
-		break;
-	case NICE_COMPONENT_STATE_CONNECTED:
-		changeState(State::Connected);
-		break;
-	case NICE_COMPONENT_STATE_READY:
-		changeState(State::Completed);
-		break;
-	case NICE_COMPONENT_STATE_FAILED:
-		changeState(State::Failed);
-		break;
-	};
-}
-
-string IceTransport::AddressToString(const NiceAddress &addr) {
-	char buffer[NICE_ADDRESS_STRING_LEN];
-	nice_address_to_string(&addr, buffer);
-	unsigned int port = nice_address_get_port(&addr);
-	std::ostringstream ss;
-	ss << buffer << ":" << port;
-	return ss.str();
-}
-
-void IceTransport::CandidateCallback(NiceAgent *agent, NiceCandidate *candidate,
-                                     gpointer userData) {
-	auto iceTransport = static_cast<rtc::impl::IceTransport *>(userData);
-	gchar *cand = nice_agent_generate_local_candidate_sdp(agent, candidate);
-	try {
-		iceTransport->processCandidate(cand);
-	} catch (const std::exception &e) {
-		PLOG_WARNING << e.what();
-	}
-	g_free(cand);
-}
-
-void IceTransport::GatheringDoneCallback(NiceAgent * /*agent*/, guint /*streamId*/,
-                                         gpointer userData) {
-	auto iceTransport = static_cast<rtc::impl::IceTransport *>(userData);
-	try {
-		iceTransport->processGatheringDone();
-	} catch (const std::exception &e) {
-		PLOG_WARNING << e.what();
-	}
-}
-
-void IceTransport::StateChangeCallback(NiceAgent * /*agent*/, guint /*streamId*/,
-                                       guint /*componentId*/, guint state, gpointer userData) {
-	auto iceTransport = static_cast<rtc::impl::IceTransport *>(userData);
-	try {
-		iceTransport->processStateChange(state);
-	} catch (const std::exception &e) {
-		PLOG_WARNING << e.what();
-	}
-}
-
-void IceTransport::RecvCallback(NiceAgent * /*agent*/, guint /*streamId*/, guint /*componentId*/,
-                                guint len, gchar *buf, gpointer userData) {
-	auto iceTransport = static_cast<rtc::impl::IceTransport *>(userData);
-	try {
-		PLOG_VERBOSE << "Incoming size=" << len;
-		auto b = reinterpret_cast<byte *>(buf);
-		iceTransport->incoming(make_message(b, b + len));
-	} catch (const std::exception &e) {
-		PLOG_WARNING << e.what();
-	}
-}
-
-gboolean IceTransport::TimeoutCallback(gpointer userData) {
-	auto iceTransport = static_cast<rtc::impl::IceTransport *>(userData);
-	try {
-		iceTransport->processTimeout();
-	} catch (const std::exception &e) {
-		PLOG_WARNING << e.what();
-	}
-	return FALSE;
-}
-
-void IceTransport::LogCallback(const gchar * /*logDomain*/, GLogLevelFlags logLevel,
-                               const gchar *message, gpointer /*userData*/) {
-	plog::Severity severity;
-	unsigned int flags = logLevel & G_LOG_LEVEL_MASK;
-	if (flags & G_LOG_LEVEL_ERROR)
-		severity = plog::fatal;
-	else if (flags & G_LOG_LEVEL_CRITICAL)
-		severity = plog::error;
-	else if (flags & G_LOG_LEVEL_WARNING)
-		severity = plog::warning;
-	else if (flags & G_LOG_LEVEL_MESSAGE)
-		severity = plog::info;
-	else if (flags & G_LOG_LEVEL_INFO)
-		severity = plog::info;
-	else
-		severity = plog::verbose; // libnice debug as verbose
-
-	PLOG(severity) << "nice: " << message;
-}
-
-bool IceTransport::getSelectedCandidatePair(Candidate *local, Candidate *remote) {
-	NiceCandidate *niceLocal, *niceRemote;
-	if (!nice_agent_get_selected_pair(mNiceAgent.get(), mStreamId, 1, &niceLocal, &niceRemote))
-		return false;
-
-	gchar *sdpLocal = nice_agent_generate_local_candidate_sdp(mNiceAgent.get(), niceLocal);
-	if (local)
-		*local = Candidate(sdpLocal, mMid);
-	g_free(sdpLocal);
-
-	gchar *sdpRemote = nice_agent_generate_local_candidate_sdp(mNiceAgent.get(), niceRemote);
-	if (remote)
-		*remote = Candidate(sdpRemote, mMid);
-	g_free(sdpRemote);
-
-	if (local)
-		local->resolve(Candidate::ResolveMode::Simple);
-	if (remote)
-		remote->resolve(Candidate::ResolveMode::Simple);
-	return true;
-}
-
-#endif
 
 } // namespace rtc::impl
